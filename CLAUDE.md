@@ -43,6 +43,15 @@ block in `extract.py`, a `SHEETS` entry in `leanix.py`, and a `SHEETS` entry in
   invite plausible-sounding guesses about lifecycle, criticality, or ownership.
 - **`SHEETS` in `leanix.py` is the tenant-adaptation seam.** Keep column
   definitions declarative there rather than scattering formatting logic.
+- **The API key is handled deliberately, not incidentally.** It arrives as an
+  `X-Anthropic-Api-Key` header (headers stay out of access logs and browser
+  history, unlike form fields and query params), is used to build a client for
+  one request, and is never persisted or echoed back. On the client it lives in
+  `sessionStorage`, not `localStorage`. If you touch this path, don't log the
+  request headers, don't add the key to any response, and don't move it to a
+  query parameter for convenience.
+- **Anthropic SDK errors are mapped to short messages in `extract.py`** and
+  re-raised with `from None`, so request internals don't reach the browser.
 - Static assets are served `no-store` on purpose — the frontend is edited in
   place and a cached `app.js` silently serves stale behaviour.
 

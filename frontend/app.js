@@ -111,8 +111,46 @@ function renderFiles() {
     li.append(span, btn);
     ul.append(li);
   });
-  $('#analyse').disabled = files.length === 0;
+  updateAnalyseEnabled();
 }
+
+// ----------------------------------------------------------------- api key
+
+// The key lives in sessionStorage rather than localStorage: it should not
+// outlive the browser session, and it goes nowhere except this local server.
+const KEY_STORE = 'eatools.apiKey';
+let serverHasCredentials = false;
+
+const keyInput = $('#api-key');
+
+function apiKey() {
+  return serverHasCredentials ? '' : keyInput.value.trim();
+}
+
+function updateAnalyseEnabled() {
+  const haveCreds = serverHasCredentials || apiKey() !== '';
+  $('#analyse').disabled = files.length === 0 || !haveCreds;
+}
+
+keyInput.addEventListener('input', () => {
+  sessionStorage.setItem(KEY_STORE, keyInput.value.trim());
+  updateAnalyseEnabled();
+  if (apiKey()) setStatus('');
+});
+
+$('#key-toggle').addEventListener('click', (e) => {
+  const shown = keyInput.type === 'text';
+  keyInput.type = shown ? 'password' : 'text';
+  e.target.textContent = shown ? 'Show' : 'Hide';
+  e.target.setAttribute('aria-pressed', String(!shown));
+});
+
+$('#key-clear').addEventListener('click', () => {
+  keyInput.value = '';
+  sessionStorage.removeItem(KEY_STORE);
+  updateAnalyseEnabled();
+  setStatus('Enter an API key to analyse diagrams.');
+});
 
 // ---------------------------------------------------------------- analysing
 
@@ -130,8 +168,13 @@ $('#analyse').addEventListener('click', async () => {
   $('#analyse').disabled = true;
   setStatus('Reading diagrams — this can take a minute or two', 'busy');
 
+  // Header rather than a form field: keeps the key out of the access log.
+  const headers = {};
+  const key = apiKey();
+  if (key) headers['X-Anthropic-Api-Key'] = key;
+
   try {
-    const res = await fetch('/api/analyse', { method: 'POST', body });
+    const res = await fetch('/api/analyse', { method: 'POST', body, headers });
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
       throw new Error(err.detail || `Request failed (${res.status})`);
@@ -142,7 +185,7 @@ $('#analyse').addEventListener('click', async () => {
   } catch (err) {
     setStatus(err.message, 'error');
   } finally {
-    $('#analyse').disabled = files.length === 0;
+    updateAnalyseEnabled();
   }
 });
 
@@ -334,8 +377,13 @@ $('#restart').addEventListener('click', () => {
 fetch('/api/health')
   .then((r) => r.json())
   .then((h) => {
-    if (!h.credentials) {
-      setStatus('ANTHROPIC_API_KEY is not set — restart the server with it exported.', 'error');
+    serverHasCredentials = !!h.credentials;
+    // Only ask for a key if the server hasn't already got one.
+    $('#key-row').hidden = serverHasCredentials;
+    if (!serverHasCredentials) {
+      keyInput.value = sessionStorage.getItem(KEY_STORE) || '';
+      if (!keyInput.value) setStatus('Enter an API key to analyse diagrams.');
     }
+    updateAnalyseEnabled();
   })
   .catch(() => {});

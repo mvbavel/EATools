@@ -8,12 +8,36 @@ unambiguous enough to import unattended.
 ## Run it
 
 ```bash
-export ANTHROPIC_API_KEY=sk-ant-...
 pip3 install --break-system-packages -r requirements.txt
 python3 -m uvicorn eatools.app:app --port 8100 --reload
 ```
 
 Then open <http://localhost:8100>.
+
+## Supplying an API key
+
+Two options — the app works either way.
+
+**Environment (preferred).** Start the server with `ANTHROPIC_API_KEY` set and
+the key never touches the browser; the key field hides itself:
+
+```bash
+ANTHROPIC_API_KEY=sk-ant-... python3 -m uvicorn eatools.app:app --port 8100
+```
+
+**In the app.** If the server has no key, a field appears. What happens to it:
+
+- Kept in `sessionStorage`, so it dies with the browser tab — not `localStorage`
+- Sent as an `X-Anthropic-Api-Key` header, not a form field or query string, so
+  it stays out of uvicorn's access log and out of browser history
+- Used to construct a client for that one request; never written to disk,
+  never logged, never returned in a response
+- Masked by default, with explicit Show and Clear controls
+
+The caveat worth knowing: this is plain HTTP on loopback, which is fine on your
+own machine. **Don't bind this server to `0.0.0.0` or put it behind a tunnel**
+while using the in-app key field — the key would cross the network in clear text.
+For anything beyond localhost, use the environment variable instead.
 
 ## How it works
 

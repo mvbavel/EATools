@@ -89,7 +89,7 @@ section {
 label { display: block; margin: 1.25rem 0 0.4rem; font-weight: 600; }
 .hint { font-weight: 400; color: var(--muted); font-size: 0.85rem; }
 
-textarea, input[type="text"] {
+textarea, input[type="text"], input[type="password"] {
   width: 100%;
   padding: 0.6rem;
   border: 1px solid var(--line);
@@ -100,6 +100,25 @@ textarea, input[type="text"] {
   resize: vertical;
 }
 textarea:focus, input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+
+/* ---- api key ---- */
+
+#key-row { margin-top: 1.25rem; }
+.key-input { display: flex; gap: 0.5rem; align-items: stretch; }
+.key-input input { flex: 1; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.key-input button { margin-top: 0; padding: 0.5rem 0.8rem; font-size: 0.85rem; white-space: nowrap; }
+.key-note {
+  margin: 0.5rem 0 0;
+  font-size: 0.82rem;
+  line-height: 1.5;
+  color: var(--muted);
+}
+.key-note code {
+  font-size: 0.95em;
+  padding: 0.05em 0.3em;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+}
 
 button {
   margin-top: 1.25rem;

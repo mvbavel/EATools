@@ -158,11 +158,19 @@ class ExtractionError(Exception):
     pass
 
 
-def _client() -> anthropic.Anthropic:
+def _client(api_key: str | None = None) -> anthropic.Anthropic:
+    """A caller-supplied key wins; otherwise fall back to the environment.
+
+    The key is used to construct a client for this one request and is never
+    stored, logged, or echoed back in a response.
+    """
+    if api_key:
+        return anthropic.Anthropic(api_key=api_key)
+
     if not (os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")):
         raise ExtractionError(
-            "No Anthropic credentials found. Set ANTHROPIC_API_KEY in the environment "
-            "before starting the server."
+            "No Anthropic credentials found. Enter an API key in the app, or set "
+            "ANTHROPIC_API_KEY in the environment before starting the server."
         )
     return anthropic.Anthropic()
 
@@ -209,25 +217,42 @@ def build_content(docs: list[SourceDoc], extra_context: str = "") -> list[dict]:
     return content
 
 
-def extract(docs: list[SourceDoc], extra_context: str = "") -> dict:
+def extract(
+    docs: list[SourceDoc],
+    extra_context: str = "",
+    api_key: str | None = None,
+) -> dict:
     """Run extraction. Returns the parsed entity payload plus token usage."""
     if not docs:
         raise ExtractionError("No readable diagrams were supplied.")
 
-    client = _client()
+    client = _client(api_key)
 
-    with client.messages.stream(
-        model=MODEL,
-        max_tokens=MAX_TOKENS,
-        system=[{"type": "text", "text": SYSTEM, "cache_control": {"type": "ephemeral"}}],
-        thinking={"type": "adaptive"},
-        output_config={
-            "effort": "high",
-            "format": {"type": "json_schema", "schema": SCHEMA},
-        },
-        messages=[{"role": "user", "content": build_content(docs, extra_context)}],
-    ) as stream:
-        message = stream.get_final_message()
+    try:
+        with client.messages.stream(
+            model=MODEL,
+            max_tokens=MAX_TOKENS,
+            system=[{"type": "text", "text": SYSTEM, "cache_control": {"type": "ephemeral"}}],
+            thinking={"type": "adaptive"},
+            output_config={
+                "effort": "high",
+                "format": {"type": "json_schema", "schema": SCHEMA},
+            },
+            messages=[{"role": "user", "content": build_content(docs, extra_context)}],
+        ) as stream:
+            message = stream.get_final_message()
+    except anthropic.AuthenticationError:
+        raise ExtractionError("API key was rejected. Check the key and try again.") from None
+    except anthropic.PermissionDeniedError:
+        raise ExtractionError(
+            f"This key lacks access to {MODEL}, or the workspace is restricted."
+        ) from None
+    except anthropic.RateLimitError:
+        raise ExtractionError("Rate limited. Wait a moment and retry.") from None
+    except anthropic.APIStatusError as exc:
+        raise ExtractionError(f"Anthropic API error ({exc.status_code}).") from None
+    except anthropic.APIConnectionError:
+        raise ExtractionError("Could not reach the Anthropic API. Check connectivity.") from None
 
     if message.stop_reason == "refusal":
         raise ExtractionError("The model declined to process this content.")

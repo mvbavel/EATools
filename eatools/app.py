@@ -10,7 +10,9 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from fastapi import FastAPI, Form, HTTPException, UploadFile
+from typing import Annotated
+
+from fastapi import FastAPI, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
@@ -35,7 +37,14 @@ def health() -> dict:
 
 
 @app.post("/api/analyse")
-async def analyse(files: list[UploadFile], context: str = Form("")) -> JSONResponse:
+async def analyse(
+    files: list[UploadFile],
+    context: str = Form(""),
+    # Carried as a header, not a form field or query param: headers stay out of
+    # uvicorn's access log and out of browser history. Used for this request
+    # only -- never stored, never returned.
+    x_anthropic_api_key: Annotated[str | None, Header()] = None,
+) -> JSONResponse:
     if not files:
         raise HTTPException(400, "No files uploaded.")
 
@@ -62,7 +71,7 @@ async def analyse(files: list[UploadFile], context: str = Form("")) -> JSONRespo
         raise HTTPException(400, "No readable diagrams. " + " ".join(skipped))
 
     try:
-        payload = extract(docs, context)
+        payload = extract(docs, context, api_key=(x_anthropic_api_key or "").strip() or None)
     except ExtractionError as exc:
         raise HTTPException(502, str(exc)) from exc
 

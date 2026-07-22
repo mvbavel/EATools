@@ -24,6 +24,22 @@
 
       <ul id="file-list"></ul>
 
+      <div id="key-row" hidden>
+        <label for="api-key">Anthropic API key</label>
+        <div class="key-input">
+          <input type="password" id="api-key" placeholder="sk-ant-..."
+                 autocomplete="off" autocapitalize="off" spellcheck="false">
+          <button type="button" id="key-toggle" class="secondary" aria-pressed="false">Show</button>
+          <button type="button" id="key-clear" class="secondary">Clear</button>
+        </div>
+        <p class="key-note">
+          Held in this browser tab only, and sent with each analysis request so the
+          server can call Claude on your behalf. Never written to disk, never logged,
+          and gone when you close the tab. To avoid entering it at all, restart the
+          server with <code>ANTHROPIC_API_KEY</code> set and this field disappears.
+        </p>
+      </div>
+
       <label for="context">Context <span class="hint">optional — org names, scope, conventions the diagram assumes</span></label>
       <textarea id="context" rows="3"
         placeholder="e.g. This is the claims platform for the UK entity. Boxes with dashed borders are planned, not live."></textarea>
