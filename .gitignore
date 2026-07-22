@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Claude Code local settings (machine-specific permissions)
+.claude/settings.local.json
+
+# Scratch / local diagram samples -- these are often confidential
+*.drawio.bak
+/samples/
+/out/
+
+# OS
+.DS_Store
