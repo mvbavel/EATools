@@ -3,8 +3,12 @@
   "configurations": [
     {
       "name": "eatools",
-      "runtimeExecutable": "python3",
-      "runtimeArgs": ["-m", "uvicorn", "eatools.app:app", "--port", "8100", "--reload"],
+      "autoPort": true,
+      "runtimeExecutable": "sh",
+      "runtimeArgs": [
+        "-c",
+        "exec python3 -m uvicorn eatools.app:app --host 127.0.0.1 --port \"${PORT:-8100}\" --reload"
+      ],
       "port": 8100
     }
   ]
