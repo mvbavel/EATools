@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>EATools — diagram to LeanIX</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header>
+    <h1>EATools</h1>
+    <p class="tagline">Extract enterprise-architecture entities from IT diagrams, review, and export to LeanIX.</p>
+  </header>
+
+  <main>
+    <!-- Upload / input stage -->
+    <section id="input-stage">
+      <div id="dropzone" tabindex="0" aria-label="Upload diagrams">
+        <p><strong>Drop diagrams here</strong> or click to choose files</p>
+        <p class="hint">.drawio .xml .vsdx .pptx .pdf .png .jpg .jpeg .gif .webp</p>
+        <input id="file-input" type="file" multiple
+               accept=".drawio,.xml,.vsdx,.pptx,.pdf,.png,.jpg,.jpeg,.gif,.webp" hidden>
+      </div>
+      <ul id="file-list"></ul>
+
+      <label class="field">
+        <span>Architect context (optional)</span>
+        <textarea id="context" rows="3"
+          placeholder="e.g. This is our order-to-cash landscape; SAP is the ERP of record."></textarea>
+      </label>
+
+      <div id="key-field" class="field" hidden>
+        <span>Anthropic API key</span>
+        <div class="key-row">
+          <input id="api-key" type="password" autocomplete="off" spellcheck="false"
+                 placeholder="sk-ant-...">
+          <button id="key-show" type="button">Show</button>
+          <button id="key-clear" type="button">Clear</button>
+        </div>
+        <p class="hint">Stored only in this tab (sessionStorage). Do not use over plain HTTP beyond localhost — set ANTHROPIC_API_KEY on the server instead.</p>
+      </div>
+
+      <button id="analyse" type="button" disabled>Analyse</button>
+      <p id="status" role="status"></p>
+    </section>
+
+    <!-- Review stage -->
+    <section id="review-stage" hidden>
+      <div id="summary-panel"></div>
+      <div id="meta-panel"></div>
+
+      <div id="tabs" role="tablist"></div>
+      <div id="tab-content"></div>
+
+      <div id="questions-panel"></div>
+      <div id="merge-panel"></div>
+
+      <div id="export-bar">
+        <button id="export-all" type="button">Export all (zip)</button>
+        <button id="export-sheet" type="button">Export this sheet (CSV)</button>
+        <button id="export-graph-json" type="button">Graph (JSON)</button>
+        <button id="export-graph-graphml" type="button">Graph (GraphML)</button>
+        <button id="start-over" type="button" class="secondary">Start over</button>
+      </div>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>

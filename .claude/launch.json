@@ -1,0 +1,11 @@
+{
+  "configurations": [
+    {
+      "name": "eatools",
+      "type": "shell",
+      "command": "python3 -m uvicorn eatools.app:app --host 127.0.0.1 --port 8100 --reload",
+      "cwd": "${workspaceFolder}",
+      "port": 8100
+    }
+  ]
+}

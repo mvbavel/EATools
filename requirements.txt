@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+anthropic
+python-pptx
+PyMuPDF
+Pillow
+lxml
+python-multipart
