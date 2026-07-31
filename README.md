@@ -1,5 +1,7 @@
 # EATools
 
+[![GitHub](https://img.shields.io/badge/GitHub-mvbavel%2FEATools-181717?logo=github)](https://github.com/mvbavel/EATools)
+
 Reads IT architecture diagrams, extracts the applications, capabilities, IT
 components, data objects and integrations they depict, and exports them as
 LeanIX import CSVs — with a review step in between, because a diagram is never
