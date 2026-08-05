@@ -215,7 +215,9 @@ def _merge_field(members: list[dict], field: str) -> tuple[str, list[str]]:
     best_val, best_rank = "", -1
     seen: set[str] = set()
     for ent in members:
-        val = (ent.get(field) or "").strip()
+        # Not every schema field is a string -- `capabilities.level` is an int enum.
+        raw = ent.get(field)
+        val = "" if raw is None else str(raw).strip()
         if not val or val == "unknown":
             continue
         seen.add(val)
@@ -236,10 +238,17 @@ _LIST_FIELDS = {
 }
 _SCALAR_ENUMS = {
     "applications": ["business_criticality", "lifecycle", "hosting"],
-    "capabilities": ["level", "parent"],
+    "capabilities": ["level"],
     "it_components": ["category"],
     "data_objects": ["classification"],
-    "interfaces": ["provider", "consumer", "integration_type", "frequency"],
+    "interfaces": ["integration_type", "frequency"],
+}
+# Scalar fields holding another entity's *name*. Merged as text: a missing value stays
+# empty, never "unknown" -- that string would import as a phantom parent/endpoint and
+# would have `_build_graph` draw an edge to a node that does not exist.
+_SCALAR_REFS = {
+    "capabilities": ["parent"],
+    "interfaces": ["provider", "consumer"],
 }
 
 
@@ -329,12 +338,15 @@ def _merge_entity(type_key: str, members: list[dict]) -> dict:
     merged: dict = {"name": name}
 
     conflicts: list[str] = []
-    for field in _SCALAR_ENUMS.get(type_key, []) + ["alias", "description"]:
+    enum_fields = _SCALAR_ENUMS.get(type_key, [])
+    ref_fields = _SCALAR_REFS.get(type_key, [])
+    for field in enum_fields + ref_fields + ["alias", "description"]:
         if field not in members[0]:
             continue
         val, field_conflicts = _merge_field(members, field)
-        merged[field] = val if val else ("unknown" if field in _SCALAR_ENUMS.get(type_key, []) else "")
-        if field_conflicts and field in _SCALAR_ENUMS.get(type_key, []):
+        merged[field] = val if val else ("unknown" if field in enum_fields else "")
+        # Disagreeing parents/endpoints across documents is a real ambiguity, not noise.
+        if field_conflicts and field in enum_fields + ref_fields:
             conflicts.append(f"{field}={field_conflicts}")
 
     # `level` is numeric; keep the mode-ish highest-confidence value as-is if present.
