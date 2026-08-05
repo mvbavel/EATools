@@ -168,7 +168,13 @@ def _ingest_drawio(filename: str, data: bytes) -> SourceDoc:
     if diagrams:
         for i, diagram in enumerate(diagrams, 1):
             name = diagram.get("name") or str(i)
-            inner = _decode_drawio_payload(diagram.text or "")
+            # Uncompressed exports nest <mxGraphModel> as a child element; compressed
+            # ones store the deflate+base64 payload as <diagram> text.
+            model = diagram.find("mxGraphModel")
+            if model is not None:
+                inner = ET.tostring(model, encoding="unicode")
+            else:
+                inner = _decode_drawio_payload(diagram.text or "")
             try:
                 pages.append(_parse_mxgraph(inner, name))
             except ET.ParseError as exc:
