@@ -67,6 +67,10 @@ section { margin-top: 1rem; }
 }
 #file-list button { background: none; border: none; color: var(--danger); cursor: pointer; font-size: 1.1rem; }
 
+/* An author `display` rule beats the UA stylesheet's `[hidden] { display: none }`,
+   so anything toggled via the hidden attribute needs this to actually disappear. */
+[hidden] { display: none !important; }
+
 .field { display: block; margin: 1rem 0; }
 .field > span { display: block; font-weight: 600; margin-bottom: 0.3rem; }
 textarea, input[type="text"], input[type="password"] {
