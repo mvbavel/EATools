@@ -7,6 +7,9 @@ venv/
 # Claude Code local settings (machine-specific permissions)
 .claude/settings.local.json
 
+# Local agent scratch notes
+AGENTS.md
+
 # Scratch / local diagram samples -- these are often confidential
 *.drawio.bak
 /samples/
