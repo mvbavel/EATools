@@ -424,7 +424,7 @@ def test_export_endpoint_accepts_payload_over_one_megabyte():
     from eatools.app import app
 
     big = _payload(applications=[_diagram_app(f"App {i}", description="x" * 400) for i in range(3000)])
-    body = json.dumps({"payload": big}).encode()
+    body = json.dumps({"payload": big, "authorisation": {"by": "M. Tester"}}).encode()
     assert len(body) > 1024 * 1024
 
     res = TestClient(app).post(

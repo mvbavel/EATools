@@ -376,6 +376,7 @@ def _payload_from_records(records: list[dict], source: str, summary: str) -> dic
                 "evidence": "Alfabet primary capability",
                 "confidence": "high",
                 "_source": source,
+                "_origin": "alfabet",
             }
         platform = (rec.get("platform") or "").strip()
         if platform and platform not in components:
@@ -386,6 +387,7 @@ def _payload_from_records(records: list[dict], source: str, summary: str) -> dic
                 "evidence": "Alfabet platform (ICT object)",
                 "confidence": "high",
                 "_source": source,
+                "_origin": "alfabet",
             }
 
         # Extra names this app may appear under in a diagram. merge.py only links on them
@@ -409,6 +411,7 @@ def _payload_from_records(records: list[dict], source: str, summary: str) -> dic
                 "evidence": rec.get("evidence", ""),
                 "confidence": "high",
                 "_source": source,
+                "_origin": "alfabet",
                 "_alfabet_ref": (rec.get("ref") or "").strip(),
                 "_match_names": [n for n in match_names if n],
             }
@@ -493,11 +496,16 @@ def _api_text(value) -> str:
 
 
 @dataclass
-class _Issue:
+class _Planned:
+    """What export would do for one application -- shown for authorisation, then written."""
+
+    app_id: str
     name: str
-    operation: str
-    reference: str
-    issue: str
+    operation: str  # Create | Update | Unchanged | Skipped
+    reference: str = ""
+    notes: list[str] = field(default_factory=list)
+    values: dict[str, str] = field(default_factory=dict)  # Alfabet property -> value to write
+    existing: _Row | None = None  # the template row an Update rewrites
 
 
 class _SharedStrings:
@@ -595,10 +603,8 @@ def _renumber_cell(cell: _Cell, number: int) -> str:
     return f"<c{attrs}>{cell.inner}</c>" if cell.inner else f"<c{attrs}/>"
 
 
-def build_edc(template_name: str, template_bytes: bytes, payload: dict) -> bytes:
-    """Fill the EDC template with the payload's applications; return a zip (xlsx + report)."""
-    wb = EdcWorkbook(template_name, template_bytes)
-    strings = _SharedStrings(wb.shared_strings)
+def _plan(wb: EdcWorkbook, payload: dict) -> list[_Planned]:
+    """Decide Create / Update / Unchanged / Skipped for every application in the payload."""
     col_of = wb.col_of
     by_ref = {r.get(col_of[_REFERENCE]).strip(): r for r in wb.rows if r.get(col_of[_REFERENCE]).strip()}
     existing_names = [
@@ -606,34 +612,25 @@ def build_edc(template_name: str, template_bytes: bytes, payload: dict) -> bytes
         for n in (r.get(col_of["Name"]).strip() for r in wb.rows)
         if n
     ]
-    # Create rows borrow per-column styles from the first data row (or the header).
-    style_row = wb.rows[0] if wb.rows else wb.header
-    style_for = {c: _style_of(cell.attrs) for c, cell in style_row.cells.items()}
-    all_cols = sorted(set(wb.header.cells) | set(style_row.cells), key=_col_index)
-
-    report: list[_Issue] = []
-    out_rows: list[str] = []
-    next_row = 2
-    counts = {"Create": 0, "Update": 0, "unchanged": 0, "skipped": 0}
-
-    for app in payload.get("applications", []):
+    planned: list[_Planned] = []
+    for index, app in enumerate(payload.get("applications", [])):
         name = str(app.get("name", "")).strip()
         if not name:
             continue
+        app_id = str(app.get("_id") or f"app:{index}")
         refs = [r.strip() for r in str(app.get("_alfabet_ref", "") or "").split(";") if r.strip()]
-        notes: list[str] = []
 
         if len(refs) > 1:
-            counts["skipped"] += 1
-            report.append(_Issue(name, "Skipped", "; ".join(refs), "matches several Alfabet objects; keep one Reference in _alfabet_ref"))
+            planned.append(_Planned(app_id, name, "Skipped", "; ".join(refs),
+                                    ["matches several Alfabet objects; keep one Reference in _alfabet_ref"]))
             continue
         if refs and refs[0] not in by_ref:
-            counts["skipped"] += 1
-            report.append(_Issue(name, "Skipped", refs[0], "Reference not found in this template; export from the workbook it came from"))
+            planned.append(_Planned(app_id, name, "Skipped", refs[0],
+                                    ["Reference not found in this template; export from the workbook it came from"]))
             continue
 
+        notes: list[str] = []
         values = _app_values(app, wb, notes)
-
         if refs:
             existing = by_ref[refs[0]]
             changed = {
@@ -642,24 +639,17 @@ def build_edc(template_name: str, template_bytes: bytes, payload: dict) -> bytes
                 if value.strip() != existing.get(col_of[prop]).strip()
             }
             if not changed:
-                counts["unchanged"] += 1
+                planned.append(_Planned(app_id, name, "Unchanged", refs[0]))
                 continue
-            cells = {c: _renumber_cell(cell, next_row) for c, cell in existing.cells.items()}
             for prop, value in changed.items():
-                col = col_of[prop]
-                style = _style_of(existing.cells[col].attrs) if col in existing.cells else style_for.get(col)
-                cells[col] = _cell_xml(col, next_row, style, value, strings)
-                old = existing.get(col)
-                notes.append(f"{wb.caption(prop)}: '{old}' -> '{value}'" if old else f"{wb.caption(prop)}: set to '{value}'")
-            operation, ref, row_attrs = "Update", refs[0], existing.attrs
+                old = existing.get(col_of[prop])
+                notes.insert(0, f"{wb.caption(prop)}: '{old}' -> '{value}'" if old else f"{wb.caption(prop)}: set to '{value}'")
+            planned.append(_Planned(app_id, name, "Update", refs[0], notes, changed, existing))
         else:
             values.setdefault("Name", name)
-            if "Stereotype" in col_of and wb.picklist_match("Stereotype", _STEREOTYPE):
-                values["Stereotype"] = wb.picklist_match("Stereotype", _STEREOTYPE)
-            cells = {c: _cell_xml(c, next_row, style_for.get(c), "", strings) for c in all_cols}
-            for prop, value in values.items():
-                col = col_of[prop]
-                cells[col] = _cell_xml(col, next_row, style_for.get(col), value, strings)
+            stereotype = wb.picklist_match("Stereotype", _STEREOTYPE) if "Stereotype" in col_of else None
+            if stereotype:
+                values["Stereotype"] = stereotype
             filled = {wb.caption(p) for p in values}
             missing = [m for m in wb.mandatory if m not in filled]
             if missing:
@@ -667,15 +657,80 @@ def build_edc(template_name: str, template_bytes: bytes, payload: dict) -> bytes
             close = _possible_duplicates(name, existing_names)
             if close:
                 notes.append(f"possible duplicate of existing: {'; '.join(close)}")
-            operation, ref, row_attrs = "Create", "", style_row.attrs
+            planned.append(_Planned(app_id, name, "Create", "", notes, values))
+    return planned
+
+
+def plan_edc(template_name: str, template_bytes: bytes, payload: dict) -> dict:
+    """Preview of the write-back for review: every Create/Update/Skipped row, plus counts."""
+    planned = _plan(EdcWorkbook(template_name, template_bytes), payload)
+    counts = {op: sum(1 for p in planned if p.operation == op) for op in ("Create", "Update", "Unchanged", "Skipped")}
+    rows = [
+        {"id": p.app_id, "name": p.name, "operation": p.operation, "reference": p.reference, "notes": p.notes}
+        for p in planned
+        if p.operation != "Unchanged"
+    ]
+    return {"rows": rows, "counts": counts}
+
+
+def build_edc(
+    template_name: str,
+    template_bytes: bytes,
+    payload: dict,
+    authorised_ids: list[str] | None = None,
+    authorisation: dict | None = None,
+) -> bytes:
+    """Fill the EDC template; return a zip (xlsx + report).
+
+    With ``authorised_ids`` only those applications' Create/Update rows are written; the
+    rest are listed in the report as not authorised.
+    """
+    wb = EdcWorkbook(template_name, template_bytes)
+    planned = _plan(wb, payload)
+    allowed = None if authorised_ids is None else set(authorised_ids)
+    strings = _SharedStrings(wb.shared_strings)
+    col_of = wb.col_of
+    # Create rows borrow per-column styles from the first data row (or the header).
+    style_row = wb.rows[0] if wb.rows else wb.header
+    style_for = {c: _style_of(cell.attrs) for c, cell in style_row.cells.items()}
+    all_cols = sorted(set(wb.header.cells) | set(style_row.cells), key=_col_index)
+
+    report: list[tuple[str, str, str, str]] = []
+    out_rows: list[str] = []
+    next_row = 2
+    counts = {"Create": 0, "Update": 0, "Unchanged": 0, "Skipped": 0, "Not authorised": 0}
+
+    for item in planned:
+        operation = item.operation
+        if operation in ("Create", "Update") and allowed is not None and item.app_id not in allowed:
+            operation = "Not authorised"
+        counts[operation] += 1
+        if operation not in ("Create", "Update"):
+            if operation != "Unchanged":
+                for note in item.notes or ["not written"]:
+                    report.append((item.name, operation, item.reference, note))
+            continue
+
+        if operation == "Update":
+            cells = {c: _renumber_cell(cell, next_row) for c, cell in item.existing.cells.items()}
+            for prop, value in item.values.items():
+                col = col_of[prop]
+                style = _style_of(item.existing.cells[col].attrs) if col in item.existing.cells else style_for.get(col)
+                cells[col] = _cell_xml(col, next_row, style, value, strings)
+            row_attrs = item.existing.attrs
+        else:
+            cells = {c: _cell_xml(c, next_row, style_for.get(c), "", strings) for c in all_cols}
+            for prop, value in item.values.items():
+                col = col_of[prop]
+                cells[col] = _cell_xml(col, next_row, style_for.get(col), value, strings)
+            row_attrs = style_row.attrs
 
         if _OPERATIONS in col_of:
             col = col_of[_OPERATIONS]
             cells[col] = _cell_xml(col, next_row, style_for.get(col), operation, strings)
-        counts[operation] += 1
         out_rows.append(_row_xml(next_row, row_attrs, cells))
-        for note in notes or ["ok"]:
-            report.append(_Issue(name, operation, ref, note))
+        for note in item.notes or ["ok"]:
+            report.append((item.name, operation, item.reference, note))
         next_row += 1
 
     xlsx = _rewrite_workbook(wb, out_rows, strings, last_row=next_row - 1)
@@ -683,7 +738,7 @@ def build_edc(template_name: str, template_bytes: bytes, payload: dict) -> bytes
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr(f"{stem}_EATools.xlsx", xlsx)
-        zf.writestr("alfabet_report.csv", _report_csv(report, counts))
+        zf.writestr("alfabet_report.csv", _report_csv(report, counts, authorisation))
     return buf.getvalue()
 
 
@@ -720,15 +775,20 @@ def _rewrite_workbook(wb: EdcWorkbook, out_rows: list[str], strings: _SharedStri
     return out.getvalue()
 
 
-def _report_csv(report: list[_Issue], counts: dict[str, int]) -> bytes:
+def _report_csv(report: list[tuple[str, str, str, str]], counts: dict[str, int], authorisation: dict | None) -> bytes:
     buf = io.StringIO()
     writer = csv.writer(buf)
+    if authorisation:
+        writer.writerow([f"Authorised by: {authorisation.get('by', '')}"])
+        writer.writerow([f"Authorised at: {authorisation.get('at', '')}"])
+        writer.writerow([])
     writer.writerow(["Name", "Operation", "Reference", "Issue"])
-    for item in report:
-        writer.writerow([item.name, item.operation, item.reference, item.issue])
+    for row in report:
+        writer.writerow(row)
     writer.writerow([])
     writer.writerow(
         [f"Totals: {counts['Create']} create, {counts['Update']} update, "
-         f"{counts['unchanged']} matched but unchanged (omitted), {counts['skipped']} skipped"]
+         f"{counts['Unchanged']} matched but unchanged (omitted), {counts['Skipped']} skipped, "
+         f"{counts['Not authorised']} not authorised"]
     )
     return b"\xef\xbb\xbf" + buf.getvalue().encode("utf-8")

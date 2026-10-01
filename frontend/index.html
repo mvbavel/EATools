@@ -9,12 +9,18 @@
 <body>
   <header>
     <h1>EATools</h1>
-    <p class="tagline">Extract enterprise-architecture entities from IT diagrams, review, and export to LeanIX or Bizzdesign Alfabet.</p>
+    <p class="tagline">Extract enterprise-architecture entities from IT diagrams and Alfabet, review matches, and export to LeanIX or Bizzdesign Alfabet.</p>
+    <nav id="main-tabs" role="tablist">
+      <button type="button" data-tab="input" class="active">1 · Input</button>
+      <button type="button" data-tab="matches" disabled>2 · Matches</button>
+      <button type="button" data-tab="review" disabled>3 · Review</button>
+      <button type="button" data-tab="output" disabled>4 · Output</button>
+    </nav>
   </header>
 
   <main>
-    <!-- Upload / input stage -->
-    <section id="input-stage">
+    <!-- 1. Input -->
+    <section id="tab-input">
       <div id="dropzone" tabindex="0" aria-label="Upload diagrams">
         <p><strong>Drop diagrams here</strong> or click to choose files</p>
         <p class="hint">.drawio .xml .vsdx .pptx .pdf .png .jpg .jpeg .gif .webp — plus an Alfabet EDC export (.xlsx) to match against</p>
@@ -66,12 +72,52 @@
         <button id="key-forget" type="button" class="secondary">Forget saved key</button>
       </p>
 
-      <button id="analyse" type="button" disabled>Analyse</button>
+      <div class="actions">
+        <button id="analyse" type="button" disabled>Analyse</button>
+        <button id="start-over" type="button" class="secondary" hidden>Start over</button>
+      </div>
       <p id="status" role="status"></p>
     </section>
 
-    <!-- Review stage -->
-    <section id="review-stage" hidden>
+    <!-- 2. Matches -->
+    <section id="tab-matches" hidden>
+      <div class="panel" id="match-summary"></div>
+      <div class="panel toolbar" id="match-toolbar">
+        <label>Type <select id="mf-type"></select></label>
+        <label>Status
+          <select id="mf-status">
+            <option value="">All</option>
+            <option value="pending" selected>Pending</option>
+            <option value="accepted">Accepted</option>
+            <option value="rejected">Rejected</option>
+          </select>
+        </label>
+        <label>Method
+          <select id="mf-method">
+            <option value="">All</option>
+            <option value="exact">Exact name</option>
+            <option value="alias">Alias / short name</option>
+            <option value="fuzzy">Fuzzy</option>
+          </select>
+        </label>
+        <label>Min score <input id="mf-score" type="number" min="0" max="100" step="5" value="0"></label>
+        <label class="grow">Search <input id="mf-search" type="text" placeholder="name contains…"></label>
+        <div class="bulk">
+          <button type="button" id="mb-accept" class="secondary">Accept shown</button>
+          <button type="button" id="mb-reject" class="secondary">Reject shown</button>
+          <button type="button" id="mb-reset" class="secondary">Reset shown</button>
+        </div>
+      </div>
+      <div id="match-notes"></div>
+      <div id="match-list"></div>
+      <div class="actions">
+        <button id="apply-matches" type="button">Apply decisions → Review</button>
+        <span id="apply-status" class="hint"></span>
+      </div>
+    </section>
+
+    <!-- 3. Review -->
+    <section id="tab-review" hidden>
       <div id="summary-panel"></div>
       <div id="meta-panel"></div>
 
@@ -80,15 +126,53 @@
 
       <div id="questions-panel"></div>
       <div id="merge-panel"></div>
+      <div class="actions">
+        <button id="to-output" type="button">Continue → Output</button>
+      </div>
+    </section>
 
-      <div id="export-bar">
-        <button id="export-all" type="button">Export all (zip)</button>
-        <button id="export-sheet" type="button">Export this sheet (CSV)</button>
-        <button id="export-graph-json" type="button">Graph (JSON)</button>
-        <button id="export-graph-graphml" type="button">Graph (GraphML)</button>
-        <button id="export-alfabet" type="button">Export to Alfabet (EDC)</button>
-        <input id="alfabet-template-input" type="file" accept=".xlsx,.xlsm" hidden>
-        <button id="start-over" type="button" class="secondary">Start over</button>
+    <!-- 4. Output -->
+    <section id="tab-output" hidden>
+      <div class="panel">
+        <h2>1. Select the items to output</h2>
+        <div class="toolbar">
+          <label class="grow">Search <input id="sel-search" type="text" placeholder="name contains…"></label>
+          <div class="bulk">
+            <button type="button" id="sel-all" class="secondary">Select shown</button>
+            <button type="button" id="sel-none" class="secondary">Clear shown</button>
+            <button type="button" id="sel-default" class="secondary">Reset to default</button>
+          </div>
+        </div>
+        <div id="sel-tabs" class="subtabs"></div>
+        <div id="sel-table"></div>
+      </div>
+
+      <div class="panel">
+        <h2>2. Alfabet write-back (EDC)</h2>
+        <p id="template-status" class="hint"></p>
+        <div class="actions">
+          <button id="choose-template" type="button" class="secondary">Choose EDC template…</button>
+          <input id="alfabet-template-input" type="file" accept=".xlsx,.xlsm" hidden>
+          <button id="preview-alfabet" type="button">Preview Alfabet changes</button>
+        </div>
+        <div id="plan-table"></div>
+      </div>
+
+      <div class="panel">
+        <h2>3. Authorise &amp; export</h2>
+        <div id="output-summary" class="hint"></div>
+        <label class="field">
+          <span>Authorised by</span>
+          <input id="auth-by" type="text" autocomplete="name" placeholder="Your name">
+        </label>
+        <label class="confirm"><input id="auth-confirm" type="checkbox"> I have reviewed the selected items and authorise this output.</label>
+        <div id="export-bar">
+          <button id="export-leanix" type="button" disabled>Export LeanIX (zip)</button>
+          <button id="export-alfabet" type="button" disabled>Export Alfabet EDC</button>
+          <button id="export-graph-json" type="button" class="secondary">Graph (JSON)</button>
+          <button id="export-graph-graphml" type="button" class="secondary">Graph (GraphML)</button>
+        </div>
+        <p id="output-status" role="status"></p>
       </div>
     </section>
   </main>

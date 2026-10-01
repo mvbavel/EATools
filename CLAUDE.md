@@ -15,9 +15,12 @@ Four backend jobs, each in one module; two data shapes everything speaks in.
   Parse failures raise `UnsupportedFile`; a bad file must never kill a multi-file batch.
 - `extract.py` — one schema-constrained Claude call **per document**. Model
   `claude-opus-4-8`, streaming, adaptive thinking, `effort: high`, cached system prompt.
-- `merge.py` — builds the in-memory graph and does hybrid cross-document resolution
-  (deterministic name/alias grouping + Claude reconciliation of near-duplicates). Union
-  attributes, accumulate evidence + provenance, bump confidence on corroboration.
+- `merge.py` — two steps. `propose()` gives entities stable `_id`s and returns match
+  proposals (exact / alias / fuzzy + optional Claude verdict) with default decisions;
+  `merge(accepted=[(id, id)])` merges **only reviewer-accepted pairs**, refusing (and
+  reporting in `blocked`) any pair that would join two Alfabet records. Alfabet entities
+  are never proposed against each other. Union attributes, accumulate evidence +
+  provenance, bump confidence on corroboration.
 - `leanix.py` — declarative `SHEETS` → CSVs + `relations.csv` + `OPEN_QUESTIONS.txt` +
   graph files → zip.
 - `alfabet.py` — Bizzdesign Alfabet EDC workbooks. `read_edc` imports rows as entities
@@ -29,6 +32,11 @@ Four backend jobs, each in one module; two data shapes everything speaks in.
 - `alfabet_api.py` — Alfabet REST v2 client (password-grant token, named report queries).
   Credentials only from `ALFABET_URL/USERNAME/PASSWORD` env; never logged or returned.
 - `app.py` — routing and error mapping only; no business logic.
+- Frontend flow: **Input → Matches → Review → Output.** The browser holds the per-source
+  payloads + decisions and posts them to `/api/merge` (server stays stateless). Output
+  exports only selected items; `/api/export` and `/api/export/alfabet` require
+  `authorisation.by` (recorded in the export), and the EDC write-back writes only the
+  plan rows the reviewer authorised. Any change after authorising withdraws it.
 
 ## Non-negotiable rules
 

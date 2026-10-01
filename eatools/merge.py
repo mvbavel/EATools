@@ -1,24 +1,27 @@
 """Consolidate per-document extractions into one picture via an in-memory graph.
 
-`merge(per_doc_payloads, client)` takes the payloads that `extract.py` produced (one per
-uploaded file, each entity tagged with `_source`) and returns::
+Matching is a **reviewable proposal step**, then a deterministic merge:
 
-    {"payload": <consolidated payload dict>, "graph": <nodes+edges>, "merge_report": [...]}
+1. `propose(per_doc_payloads, reconcile_fn)` gives every entity a stable ``_id`` and
+   returns match proposals between entities of the same type:
 
-Resolution is **hybrid**:
+   * ``exact`` -- same canonical name (accepted by default);
+   * ``alias`` -- an alias / short name / org-less name equals another entity's name
+     (accepted by default when unambiguous);
+   * ``fuzzy`` -- similar names (stdlib ``difflib``), optionally judged by one Claude
+     call per type (``ai`` = same/different); pending unless Claude confirms it and the
+     match is unambiguous.
 
-1. *Deterministic grouping* — entities whose names (or, for applications, aliases)
-   normalise to the same canonical key are merged immediately.
-2. *Ambiguous-cluster detection* — remaining names that are similar (stdlib
-   ``difflib``) but not identical become candidates.
-3. *Claude reconciliation* — one schema-constrained call per type decides which
-   candidates are genuinely the same entity (e.g. "SAP" vs "SAP ERP" vs "SAP S/4HANA").
+   Two different system-of-record entities (different ``_alfabet_ref``) are never
+   proposed as the same thing.
 
-Everything is in-memory and per-request: the graph is built, returned to the browser,
-and discarded. Nothing is written to disk — the server stays stateless.
+2. `merge(per_doc_payloads, accepted=[(id_a, id_b), ...])` merges exactly the accepted
+   pairs: union attributes, accumulate evidence + provenance, bump confidence on
+   corroboration. A pair that would join two system-of-record entities is refused and
+   reported in ``blocked``. Without ``accepted``, the default-accepted proposals are used.
 
-The reconciliation step is injected as `reconcile_fn` so it can be stubbed in tests;
-`app.py` passes a real `client` and the default LLM reconciler is used.
+Everything is in-memory and per-request; the browser holds the per-document payloads and
+the decisions and posts them back to re-merge. Nothing is written to disk.
 """
 
 from __future__ import annotations
@@ -163,46 +166,130 @@ def _alt_names(ent: dict) -> set[str]:
     return {_canon(n) for n in names if _canon(n)}
 
 
-def _group_type(
-    entities: list[dict], type_key: str, reconcile_fn
-) -> tuple[_UnionFind, dict[str, dict], list[str]]:
-    """Union-find over canonical keys for one entity type.
+def _is_record(ent: dict) -> bool:
+    """From the system of record: Alfabet apps carry a Reference, but Alfabet platforms and
+    capabilities do not -- they are distinct records all the same."""
+    return bool(ent.get(_EXTERNAL_REF)) or ent.get("_origin") == "alfabet"
 
-    Returns the union-find, a representative entity per key, and open-question notes for
-    matches that were too ambiguous to make.
-    """
-    uf = _UnionFind()
-    by_key: dict[str, dict] = {}  # canonical key -> a representative entity (highest confidence)
-    refs: dict[str, set[str]] = {}  # union-find root -> external references in that group
-    notes: list[str] = []
 
-    for ent in entities:
-        key = _canon(ent.get("name", ""))
-        if not key:
-            continue
-        uf.add(key)
-        if ent.get(_EXTERNAL_REF):
-            refs.setdefault(key, set()).add(ent[_EXTERNAL_REF])
-        cur = by_key.get(key)
-        if cur is None or _CONF_RANK.get(ent.get("confidence", ""), 0) > _CONF_RANK.get(cur.get("confidence", ""), 0):
-            by_key[key] = ent
+def assign_ids(per_doc_payloads: list[dict]) -> None:
+    """Stable per-request entity ids (type:doc:index); diagram origin unless already set."""
+    for d, payload in enumerate(per_doc_payloads):
+        for type_key in ENTITY_KEYS:
+            for i, ent in enumerate(payload.get(type_key, [])):
+                ent.setdefault("_id", f"{type_key}:{d}:{i}")
+                ent.setdefault("_origin", "diagram")
 
-    def safe_union(a: str, b: str) -> bool:
-        ra, rb = uf.find(a), uf.find(b)
+
+class _Links:
+    """Union-find over entity ids that refuses to join two different external records."""
+
+    def __init__(self, entities: dict[str, dict]) -> None:
+        self.uf = _UnionFind()
+        self.refs: dict[str, set[str]] = {}
+        for eid, ent in entities.items():
+            self.uf.add(eid)
+            if ent.get(_EXTERNAL_REF):
+                self.refs[eid] = {ent[_EXTERNAL_REF]}
+
+    def compatible(self, a: str, b: str) -> bool:
+        sa, sb = self.refs.get(self.uf.find(a), set()), self.refs.get(self.uf.find(b), set())
+        return not (sa and sb and sa != sb)
+
+    def same(self, a: str, b: str) -> bool:
+        return self.uf.find(a) == self.uf.find(b)
+
+    def union(self, a: str, b: str) -> bool:
+        ra, rb = self.uf.find(a), self.uf.find(b)
         if ra == rb:
             return True
-        sa, sb = refs.get(ra, set()), refs.get(rb, set())
-        if sa and sb and sa != sb:
+        if not self.compatible(a, b):
             return False
-        uf.union(ra, rb)
-        refs.pop(ra, None)
-        if sa | sb:
-            refs[uf.find(rb)] = sa | sb
+        merged = self.refs.pop(ra, set()) | self.refs.pop(rb, set())
+        self.uf.union(ra, rb)
+        if merged:
+            self.refs[self.uf.find(rb)] = merged
         return True
 
-    # Deterministic: link an entity to another whose *name* equals one of its aliases or
-    # match names. A name claimed by two different system-of-record objects (e.g. the
-    # same product run by two orgs) is ambiguous and left to similarity matching.
+
+def propose(per_doc_payloads: list[dict], reconcile_fn=None) -> dict:
+    """Match proposals across all documents. Returns {proposals, notes}."""
+    assign_ids(per_doc_payloads)
+    proposals: list[dict] = []
+    notes: list[str] = []
+    for type_key in ENTITY_KEYS:
+        entities = [e for p in per_doc_payloads for e in p.get(type_key, []) if _canon(e.get("name", ""))]
+        found, type_notes = _propose_type(type_key, entities, reconcile_fn)
+        proposals.extend(found)
+        notes.extend(type_notes)
+    for i, prop in enumerate(proposals):
+        prop["id"] = f"p{i}"
+    return {"proposals": proposals, "notes": notes}
+
+
+def _propose_type(type_key: str, entities: list[dict], reconcile_fn) -> tuple[list[dict], list[str]]:
+    by_id = {e["_id"]: e for e in entities}
+    # Tracks the default-accepted links so redundant proposals are not generated and
+    # default acceptance never chains two external records together.
+    links = _Links(by_id)
+    out: list[dict] = []
+    notes: list[str] = []
+    proposed: set[frozenset] = set()
+
+    def add(a: dict, b: dict, method: str, score: float, reason: str, accept: bool, ai: str | None = None) -> None:
+        pair = frozenset((a["_id"], b["_id"]))
+        if a["_id"] == b["_id"] or pair in proposed:
+            return
+        if _is_record(a) and _is_record(b) and not (a.get(_EXTERNAL_REF) and a.get(_EXTERNAL_REF) == b.get(_EXTERNAL_REF)):
+            return  # two real records are never the same thing
+        accept = accept and links.compatible(a["_id"], b["_id"])
+        proposed.add(pair)
+        out.append(
+            {
+                "type": type_key,
+                "a": a["_id"],
+                "b": b["_id"],
+                "method": method,
+                "score": round(score, 3),
+                "ai": ai,
+                "status": "accepted" if accept else "pending",
+                "reason": reason,
+            }
+        )
+        if accept:
+            links.union(a["_id"], b["_id"])
+
+    # 1. Exact canonical names.
+    groups: dict[str, list[dict]] = {}
+    for ent in entities:
+        groups.setdefault(_canon(ent["name"]), []).append(ent)
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        records: dict[str, list[dict]] = {}
+        free: list[dict] = []
+        for ent in members:
+            (records.setdefault(ent[_EXTERNAL_REF], []) if ent.get(_EXTERNAL_REF) else free).append(ent)
+        for copies in records.values():  # the same record seen twice
+            for other in copies[1:]:
+                add(copies[0], other, "exact", 1.0, "Same name and same Alfabet record", True)
+        if len(records) > 1:
+            # Duplicate names in the system of record: offer each candidate, decide nothing.
+            for ent in free:
+                for copies in records.values():
+                    add(ent, copies[0], "exact", 1.0, "Same name as several Alfabet records", False)
+            if free:
+                notes.append(
+                    f"'{free[0]['name']}' has the same name as {len(records)} separate Alfabet records; "
+                    "pick the right one in Matches."
+                )
+            continue
+        hub = next(iter(records.values()))[0] if records else members[0]
+        for ent in members:
+            if ent is not hub:
+                add(hub, ent, "exact", 1.0, "Same name", True)
+
+    # 2. Aliases, short names and org-less names (applications).
     if type_key == "applications":
         claimants: dict[str, set[str]] = {}
         for ent in entities:
@@ -210,56 +297,102 @@ def _group_type(
                 for alt in _alt_names(ent):
                     claimants.setdefault(alt, set()).add(ent[_EXTERNAL_REF])
         for ent in entities:
-            name = _canon(ent.get("name", ""))
+            own = _canon(ent["name"])
             for alt in _alt_names(ent):
-                if name and alt in by_key and alt != name and len(claimants.get(alt, ())) <= 1:
-                    safe_union(name, alt)
+                if alt == own:
+                    continue
+                ambiguous = len(claimants.get(alt, ())) > 1
+                for target in groups.get(alt, []):
+                    if links.same(ent["_id"], target["_id"]):
+                        continue
+                    reason = f"'{target['name']}' is an alias / short name of '{ent['name']}'"
+                    if ambiguous:
+                        reason += " -- but several Alfabet records share it"
+                    add(ent, target, "alias", 0.95, reason, not ambiguous)
 
-    # Ambiguous clusters: similar-but-not-identical keys → candidates for the LLM. Two
-    # system-of-record entities can never merge, so those pairs are skipped -- with a
-    # 2,500-row Alfabet import that is millions of comparisons avoided.
-    keys = sorted(by_key)
-    anchored = {k for k in keys if refs.get(uf.find(k))}
-    involved: set[str] = set()
+    # 3. Fuzzy names, with an optional Claude verdict. Comparisons are between canonical
+    # names; two system-of-record names are never compared (millions of pairs saved on a
+    # full Alfabet import).
+    rep: dict[str, dict] = {}
+    for key, members in groups.items():
+        rep[key] = next((m for m in members if _is_record(m)), members[0])
+    keys = sorted(rep)
+    anchored = {k for k in keys if _is_record(rep[k])}
+    pairs: list[tuple[str, str, float]] = []
     matcher = difflib.SequenceMatcher(None)
     for a in keys:
         if a in anchored:
             continue
         matcher.set_seq2(a)
         for b in keys:
-            if b == a or (b not in anchored and b < a) or uf.find(a) == uf.find(b):
+            if b == a or (b not in anchored and b < a) or links.same(rep[a]["_id"], rep[b]["_id"]):
                 continue
             matcher.set_seq1(b)
             if (
                 matcher.real_quick_ratio() >= SIMILARITY_THRESHOLD
                 and matcher.quick_ratio() >= SIMILARITY_THRESHOLD
-                and matcher.ratio() >= SIMILARITY_THRESHOLD
             ):
-                involved.add(a)
-                involved.add(b)
+                score = matcher.ratio()
+                if score >= SIMILARITY_THRESHOLD:
+                    pairs.append((a, b, score))
 
-    if involved and reconcile_fn is not None:
+    verdict: dict[frozenset, str] = {}
+    if pairs and reconcile_fn is not None:
+        involved = sorted({k for a, b, _ in pairs for k in (a, b)})
         candidates = [
             {
-                "name": by_key[k].get("name", ""),
-                "description": by_key[k].get("description", ""),
-                "sources": by_key[k].get("_source", ""),
+                "name": rep[k].get("name", ""),
+                "description": rep[k].get("description", ""),
+                "sources": rep[k].get("_source", ""),
             }
-            for k in sorted(involved)
+            for k in involved
         ]
-        for member_names in reconcile_fn(type_key, candidates):
-            member_keys = [_canon(m) for m in member_names if _canon(m) in by_key]
-            distinct = {frozenset(refs[uf.find(k)]) for k in member_keys if refs.get(uf.find(k))}
-            if len(distinct) > 1:
-                notes.append(
-                    f"Possible match among {type_key}: {', '.join(member_names)} -- several are "
-                    "separate Alfabet records, so nothing was merged; set _alfabet_ref by hand if one is right."
-                )
-                continue
-            for other in member_keys[1:]:
-                safe_union(member_keys[0], other)
+        group_of: dict[str, int] = {}
+        for gi, member_names in enumerate(reconcile_fn(type_key, candidates)):
+            for name in member_names:
+                if _canon(name) in rep:
+                    group_of[_canon(name)] = gi
+        for a, b, _ in pairs:
+            same = a in group_of and group_of.get(a) == group_of.get(b)
+            verdict[frozenset((a, b))] = "same" if same else "different"
+        # Claude may group names the similarity pass did not pair; offer those too.
+        by_group: dict[int, list[str]] = {}
+        for key, gi in group_of.items():
+            by_group.setdefault(gi, []).append(key)
+        paired = {frozenset((a, b)) for a, b, _ in pairs}
+        for members in by_group.values():
+            for i, a in enumerate(members):
+                for b in members[i + 1 :]:
+                    if frozenset((a, b)) not in paired and not (a in anchored and b in anchored):
+                        pairs.append((a, b, difflib.SequenceMatcher(None, a, b).ratio()))
+                        verdict[frozenset((a, b))] = "same"
 
-    return uf, by_key, notes
+    # A name Claude ties to several separate records is ambiguous: offer, don't accept.
+    record_hits: dict[str, set[str]] = {}
+    for a, b, _ in pairs:
+        if verdict.get(frozenset((a, b))) == "same":
+            for x, y in ((a, b), (b, a)):
+                if y in anchored and rep[y].get(_EXTERNAL_REF):
+                    record_hits.setdefault(x, set()).add(rep[y][_EXTERNAL_REF])
+    for key, refs in record_hits.items():
+        if len(refs) > 1:
+            names = [rep[key]["name"]] + sorted(
+                rep[k]["name"] for k in anchored if rep[k].get(_EXTERNAL_REF) in refs
+            )
+            notes.append(
+                f"Possible match among {type_key}: {', '.join(names)} -- several are separate "
+                "Alfabet records, so nothing was merged; pick one in Matches."
+            )
+
+    for a, b, score in sorted(pairs, key=lambda p: -p[2]):
+        ai = verdict.get(frozenset((a, b)))
+        ambiguous = len(record_hits.get(a, ())) > 1 or len(record_hits.get(b, ())) > 1
+        reason = f"Similar names ({score:.0%})"
+        if ai:
+            reason += f"; Claude judged them {'the same' if ai == 'same' else 'different'}"
+        add(rep[a], rep[b], "fuzzy", score, reason, ai == "same" and not ambiguous, ai)
+
+    return out, notes
 
 
 def _pick_canonical_name(members: list[dict]) -> str:
@@ -317,11 +450,43 @@ _SCALAR_REFS = {
 }
 
 
-def merge(per_doc_payloads: list[dict], client: anthropic.Anthropic | None = None, reconcile_fn=None):
-    """Consolidate per-document payloads. Returns {payload, graph, merge_report}."""
-    if reconcile_fn is None and client is not None:
-        reconcile_fn = _llm_reconcile(client)
+def merge(
+    per_doc_payloads: list[dict],
+    client: anthropic.Anthropic | None = None,
+    reconcile_fn=None,
+    accepted: list[tuple[str, str]] | None = None,
+):
+    """Consolidate per-document payloads. Returns {payload, graph, merge_report, blocked}.
 
+    With ``accepted`` (pairs of entity ids) exactly those pairs are merged -- the review
+    path. Without it, matches are proposed and the default-accepted ones are used.
+    """
+    notes: list[str] = []
+    if accepted is None:
+        if reconcile_fn is None and client is not None:
+            reconcile_fn = _llm_reconcile(client)
+        proposed = propose(per_doc_payloads, reconcile_fn)
+        accepted = [(p["a"], p["b"]) for p in proposed["proposals"] if p["status"] == "accepted"]
+        notes = proposed["notes"]
+    else:
+        assign_ids(per_doc_payloads)
+
+    result = _merge_accepted(per_doc_payloads, accepted)
+    result["payload"]["open_questions"].extend(notes)
+    return result
+
+
+def propose_and_merge(per_doc_payloads: list[dict], client: anthropic.Anthropic | None = None) -> dict:
+    """Proposals plus the merge of their defaults: what the review UI starts from."""
+    proposed = propose(per_doc_payloads, _llm_reconcile(client) if client is not None else None)
+    accepted = [(p["a"], p["b"]) for p in proposed["proposals"] if p["status"] == "accepted"]
+    merged = _merge_accepted(per_doc_payloads, accepted)
+    merged["proposals"] = proposed["proposals"]
+    merged["notes"] = proposed["notes"]
+    return merged
+
+
+def _merge_accepted(per_doc_payloads: list[dict], accepted) -> dict:
     merged_payload: dict = {"diagram_summary": "", "open_questions": []}
     merge_report: list[dict] = []
     name_maps: dict[str, dict[str, str]] = {}  # type_key -> canon(name) -> canonical display name
@@ -338,29 +503,41 @@ def merge(per_doc_payloads: list[dict], client: anthropic.Anthropic | None = Non
             summaries.append(f"[{src}] {s}" if src else s)
     merged_payload["diagram_summary"] = "\n\n".join(summaries)
 
-    # First pass: group and merge each type, building name maps for reference rewriting.
-    merged_by_type: dict[str, list[dict]] = {}
-    match_notes: list[str] = []
-    for type_key in ENTITY_KEYS:
-        entities = [e for p in per_doc_payloads for e in p.get(type_key, [])]
-        uf, by_key, notes = _group_type(entities, type_key, reconcile_fn)
-        match_notes.extend(notes)
+    entities = {
+        e["_id"]: e
+        for p in per_doc_payloads
+        for t in ENTITY_KEYS
+        for e in p.get(t, [])
+        if _canon(e.get("name", ""))
+    }
+    type_of = {e["_id"]: t for p in per_doc_payloads for t in ENTITY_KEYS for e in p.get(t, [])}
+    links = _Links(entities)
+    blocked: list[list[str]] = []
+    for pair in accepted or []:
+        a, b = (list(pair) + ["", ""])[:2]
+        if a not in entities or b not in entities or type_of[a] != type_of[b]:
+            continue
+        if not links.union(a, b):
+            blocked.append([a, b])
 
-        # component root -> member entities
+    merged_by_type: dict[str, list[dict]] = {}
+    for type_key in ENTITY_KEYS:
         components: dict[str, list[dict]] = {}
-        for ent in entities:
-            key = _canon(ent.get("name", ""))
-            if not key:
-                continue
-            components.setdefault(uf.find(key), []).append(ent)
+        for p in per_doc_payloads:
+            for ent in p.get(type_key, []):
+                if ent.get("_id") in entities:
+                    components.setdefault(links.uf.find(ent["_id"]), []).append(ent)
 
         name_map: dict[str, str] = {}
         merged_entities: list[dict] = []
         for members in components.values():
             merged = _merge_entity(type_key, members)
+            merged["_id"] = members[0]["_id"]
+            merged["_members"] = [m["_id"] for m in members]
             merged_entities.append(merged)
             for m in members:
-                name_map[_canon(m.get("name", ""))] = merged["name"]
+                # First wins: a rejected exact match leaves two entities with one name.
+                name_map.setdefault(_canon(m.get("name", "")), merged["name"])
             if len({_canon(m.get("name", "")) for m in members}) > 1:
                 merge_report.append(
                     {
@@ -368,7 +545,7 @@ def merge(per_doc_payloads: list[dict], client: anthropic.Anthropic | None = Non
                         "canonical": merged["name"],
                         "merged_from": sorted({m.get("name", "") for m in members}),
                         "sources": merged.get("_source", ""),
-                        "method": "deterministic+claude",
+                        "method": "accepted match",
                     }
                 )
         merged_by_type[type_key] = merged_entities
@@ -393,11 +570,10 @@ def merge(per_doc_payloads: list[dict], client: anthropic.Anthropic | None = Non
                 questions.append(
                     f"Conflicting values for {type_key[:-1]} '{ent['name']}': {ent['_conflicts']}"
                 )
-    questions.extend(match_notes)
     merged_payload["open_questions"] = questions
 
     graph = _build_graph(merged_by_type)
-    return {"payload": merged_payload, "graph": graph, "merge_report": merge_report}
+    return {"payload": merged_payload, "graph": graph, "merge_report": merge_report, "blocked": blocked}
 
 
 def _merge_entity(type_key: str, members: list[dict]) -> dict:
@@ -446,6 +622,7 @@ def _merge_entity(type_key: str, members: list[dict]) -> dict:
     merged["confidence"] = _RANK_CONF[base_rank]
 
     merged["_source"] = "; ".join(sources)
+    merged["_origin"] = "; ".join(sorted({m.get("_origin", "diagram") for m in members}))
     # More than one reference only when the source itself holds duplicates of one name;
     # alfabet.py refuses to export such a row until a reviewer picks one.
     merged[_EXTERNAL_REF] = "; ".join(sorted({m[_EXTERNAL_REF] for m in members if m.get(_EXTERNAL_REF)}))
@@ -511,11 +688,15 @@ def _build_graph(merged_by_type: dict[str, list[dict]]) -> dict:
     """Nodes = entities keyed by (type, name); edges from references, only between known nodes."""
     nodes: list[dict] = []
     node_ids: dict[str, set[str]] = {t: set() for t in ENTITY_KEYS}
+    seen_ids: set[str] = set()
 
     for type_key in ENTITY_KEYS:
         singular = _TYPE_SINGULAR[type_key]
         for ent in merged_by_type[type_key]:
             nid = f"{singular}:{ent['name']}"
+            if nid in seen_ids:  # a rejected exact match keeps two entities of one name
+                nid = f"{nid}#{ent.get('_id', len(nodes))}"
+            seen_ids.add(nid)
             node_ids[type_key].add(ent["name"])
             nodes.append(
                 {

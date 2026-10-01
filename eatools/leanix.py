@@ -184,7 +184,18 @@ def graph_graphml(graph: dict) -> bytes:
     return "\n".join(lines).encode("utf-8")
 
 
-def build_zip(payload: dict, graph: dict) -> bytes:
+def _authorisation_txt(payload: dict, authorisation: dict) -> bytes:
+    lines = [
+        f"Authorised by: {authorisation.get('by', '')}",
+        f"Authorised at: {authorisation.get('at', '')}",
+        "",
+        "Items in this export:",
+    ]
+    lines += [f"  {spec['label']}: {len(payload.get(key, []))}" for key, spec in SHEETS.items()]
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def build_zip(payload: dict, graph: dict, authorisation: dict | None = None) -> bytes:
     """Bundle all CSVs + relations + open questions + graph files into a zip."""
     graph = graph or {"nodes": [], "edges": []}
     buf = io.BytesIO()
@@ -193,6 +204,8 @@ def build_zip(payload: dict, graph: dict) -> bytes:
             zf.writestr(spec["filename"], sheet_csv(sheet_key, payload))
         zf.writestr("relations.csv", _relations_csv(graph))
         zf.writestr("OPEN_QUESTIONS.txt", _open_questions_txt(payload))
+        if authorisation:
+            zf.writestr("AUTHORISATION.txt", _authorisation_txt(payload, authorisation))
         zf.writestr("graph.json", graph_json(graph))
         zf.writestr("graph.graphml", graph_graphml(graph))
     return buf.getvalue()
