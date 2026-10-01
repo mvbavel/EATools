@@ -25,6 +25,8 @@ const SHEETS = {
       { key: "_source", label: "_source" },
       { key: "_provenance", label: "_merged_from" },
       { key: "_conflicts", label: "_conflicts" },
+      // Alfabet Reference of the matched record: drives Update vs Create on EDC export.
+      { key: "_alfabet_ref", label: "_alfabet_ref" },
     ],
   },
   capabilities: {
@@ -87,10 +89,17 @@ const SHEETS = {
 };
 const TYPE_KEYS = Object.keys(SHEETS);
 const KEY_STORE = "eatools_key";
+// Alfabet EDC workbooks are imported without a model call, so they need no API key.
+const isEdc = (f) => /\.(xlsx|xlsm)$/i.test(f.name);
 
 const state = {
   files: [],
+  // The EDC workbook doubles as the export template; kept in memory only (stateless server).
+  alfabetTemplate: null,
   credentials: false,
+  savedKey: false, // server is using a key saved in the macOS Keychain
+  keychain: false, // server can save one
+  alfabet: false,
   payload: null,
   graph: null,
   mergeReport: [],
@@ -139,6 +148,53 @@ function setupKeyField() {
     sessionStorage.removeItem(KEY_STORE);
     refreshAnalyseButton();
   });
+
+  // Opt-in persistence. The intent header makes the browser preflight, which the server
+  // never approves cross-origin, so only this page can save or forget the key.
+  $("key-save").addEventListener("click", async () => {
+    const status = $("status");
+    status.className = "";
+    status.textContent = "Checking the key with Anthropic…";
+    try {
+      const res = await fetch("/api/key", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-EATools-Intent": "save-key" },
+        body: JSON.stringify({ key: input.value.trim() }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || `Saving failed (${res.status})`);
+      input.value = "";
+      sessionStorage.removeItem(KEY_STORE);
+      state.credentials = true;
+      state.savedKey = true;
+      status.textContent = "Key saved to the Keychain; it will be used whenever EATools starts.";
+    } catch (err) {
+      status.className = "error";
+      status.textContent = err.message || String(err);
+    }
+    renderKeyUi();
+  });
+  $("key-forget").addEventListener("click", async () => {
+    const res = await fetch("/api/key", { method: "DELETE", headers: { "X-EATools-Intent": "forget-key" } });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      $("status").className = "error";
+      $("status").textContent = data.detail || `Forget failed (${res.status})`;
+      return;
+    }
+    state.savedKey = false;
+    state.credentials = !!data.credentials;
+    $("status").className = "";
+    $("status").textContent = "Saved key removed from the Keychain.";
+    renderKeyUi();
+  });
+}
+
+function renderKeyUi() {
+  $("key-field").hidden = state.credentials;
+  $("key-save").hidden = !state.keychain;
+  $("saved-key").hidden = !state.savedKey;
+  refreshAnalyseButton();
 }
 
 // ---- file selection ---------------------------------------------------------
@@ -166,9 +222,12 @@ function renderFileList() {
     );
   });
 }
+function alfabetSelected() {
+  return state.alfabet && $("alfabet-import").checked;
+}
 function refreshAnalyseButton() {
-  const haveCreds = state.credentials || !!getKey();
-  $("analyse").disabled = !(state.files.length > 0 && haveCreds);
+  const haveCreds = state.credentials || !!getKey() || state.files.every(isEdc);
+  $("analyse").disabled = !((state.files.length > 0 || alfabetSelected()) && haveCreds);
 }
 
 // ---- analyse ----------------------------------------------------------------
@@ -177,11 +236,18 @@ async function analyse() {
   const status = $("status");
   btn.disabled = true;
   status.className = "";
-  status.textContent = `Analysing ${state.files.length} file(s)… this can take a minute.`;
+  const parts = [];
+  if (state.files.length) parts.push(`${state.files.length} file(s)`);
+  if (alfabetSelected()) parts.push("Alfabet selection");
+  status.textContent = `Analysing ${parts.join(" + ")}… this can take a minute.`;
 
   const form = new FormData();
   for (const f of state.files) form.append("files", f);
   form.append("context", $("context").value || "");
+  if (alfabetSelected()) {
+    form.append("alfabet_import", "true");
+    for (const k of ["company", "name", "version", "objectstate"]) form.append(`alfabet_${k}`, $(`alfabet-${k}`).value || "");
+  }
 
   const headers = {};
   const key = getKey();
@@ -194,6 +260,7 @@ async function analyse() {
       throw new Error(detail.detail || `Request failed (${res.status})`);
     }
     const data = await res.json();
+    state.alfabetTemplate = state.files.find(isEdc) || state.alfabetTemplate;
     loadPayload(data);
   } catch (err) {
     status.className = "error";
@@ -433,9 +500,32 @@ function setupExport() {
     download("/api/export/graph?format=json", { method: "POST", headers: JSON_HEADERS, body: exportBody() }, "graph.json"));
   $("export-graph-graphml").addEventListener("click", () =>
     download("/api/export/graph?format=graphml", { method: "POST", headers: JSON_HEADERS, body: exportBody() }, "graph.graphml"));
+
+  // Alfabet only re-imports workbooks it generated, so export fills the user's template.
+  const picker = $("alfabet-template-input");
+  const exportAlfabet = () => {
+    const form = new FormData();
+    form.append("template", state.alfabetTemplate);
+    // As a file part: plain form fields are capped at 1 MB server-side.
+    form.append("body", new Blob([exportBody()], { type: "application/json" }), "payload.json");
+    download("/api/export/alfabet", { method: "POST", body: form }, "alfabet_export.zip");
+  };
+  $("export-alfabet").addEventListener("click", () => {
+    if (state.alfabetTemplate) exportAlfabet();
+    else picker.click();
+  });
+  picker.addEventListener("change", () => {
+    if (picker.files.length) {
+      state.alfabetTemplate = picker.files[0];
+      exportAlfabet();
+    }
+    picker.value = "";
+  });
+
   $("start-over").addEventListener("click", () => {
     state.files = [];
     state.payload = null;
+    state.alfabetTemplate = null;
     renderFileList();
     $("review-stage").hidden = true;
     $("input-stage").hidden = false;
@@ -464,10 +554,17 @@ async function init() {
     const res = await fetch("/api/health");
     const h = await res.json();
     state.credentials = !!h.credentials;
+    state.savedKey = !!h.saved_key;
+    state.keychain = !!h.keychain;
+    state.alfabet = !!h.alfabet;
   } catch (_) {
     state.credentials = false;
+    state.alfabet = false;
   }
-  $("key-field").hidden = state.credentials;
+  renderKeyUi();
+  // Alfabet credentials live server-side only; the panel appears when the server has them.
+  $("alfabet-field").hidden = !state.alfabet;
+  $("alfabet-import").addEventListener("change", refreshAnalyseButton);
   refreshAnalyseButton();
 }
 

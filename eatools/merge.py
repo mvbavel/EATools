@@ -34,6 +34,11 @@ SIMILARITY_THRESHOLD = 0.82
 _CONF_RANK = {"high": 3, "medium": 2, "low": 1, "": 0}
 _RANK_CONF = {3: "high", 2: "medium", 1: "low"}
 
+# Identity of an entity imported from a system of record (see alfabet.py). Two entities
+# with different references are two real objects: they are never merged, their name wins
+# a merged group, and their values win confidence ties.
+_EXTERNAL_REF = "_alfabet_ref"
+
 # Which reference fields on each entity type point at which other type. Used to rewrite
 # cross-references to canonical names and to build graph edges.
 _REFERENCES = {
@@ -152,36 +157,84 @@ def _llm_reconcile(client: anthropic.Anthropic):
 # ---------------------------------------------------------------------------
 
 
-def _group_type(entities: list[dict], type_key: str, reconcile_fn) -> tuple[_UnionFind, dict[str, dict]]:
-    """Union-find over canonical keys for one entity type, with a representative entity per key."""
+def _alt_names(ent: dict) -> set[str]:
+    """Canonical alias + match names (e.g. an Alfabet name without its org suffix)."""
+    names = [ent.get("alias", "")] + list(ent.get("_match_names") or [])
+    return {_canon(n) for n in names if _canon(n)}
+
+
+def _group_type(
+    entities: list[dict], type_key: str, reconcile_fn
+) -> tuple[_UnionFind, dict[str, dict], list[str]]:
+    """Union-find over canonical keys for one entity type.
+
+    Returns the union-find, a representative entity per key, and open-question notes for
+    matches that were too ambiguous to make.
+    """
     uf = _UnionFind()
     by_key: dict[str, dict] = {}  # canonical key -> a representative entity (highest confidence)
+    refs: dict[str, set[str]] = {}  # union-find root -> external references in that group
+    notes: list[str] = []
 
     for ent in entities:
         key = _canon(ent.get("name", ""))
         if not key:
             continue
         uf.add(key)
+        if ent.get(_EXTERNAL_REF):
+            refs.setdefault(key, set()).add(ent[_EXTERNAL_REF])
         cur = by_key.get(key)
         if cur is None or _CONF_RANK.get(ent.get("confidence", ""), 0) > _CONF_RANK.get(cur.get("confidence", ""), 0):
             by_key[key] = ent
 
-    # Deterministic: link applications whose alias matches another entity's name.
-    if type_key == "applications":
-        for ent in entities:
-            alias = _canon(ent.get("alias", ""))
-            name = _canon(ent.get("name", ""))
-            if alias and name and alias in by_key and alias != name:
-                uf.union(name, alias)
+    def safe_union(a: str, b: str) -> bool:
+        ra, rb = uf.find(a), uf.find(b)
+        if ra == rb:
+            return True
+        sa, sb = refs.get(ra, set()), refs.get(rb, set())
+        if sa and sb and sa != sb:
+            return False
+        uf.union(ra, rb)
+        refs.pop(ra, None)
+        if sa | sb:
+            refs[uf.find(rb)] = sa | sb
+        return True
 
-    # Ambiguous clusters: similar-but-not-identical keys → candidates for the LLM.
+    # Deterministic: link an entity to another whose *name* equals one of its aliases or
+    # match names. A name claimed by two different system-of-record objects (e.g. the
+    # same product run by two orgs) is ambiguous and left to similarity matching.
+    if type_key == "applications":
+        claimants: dict[str, set[str]] = {}
+        for ent in entities:
+            if ent.get(_EXTERNAL_REF):
+                for alt in _alt_names(ent):
+                    claimants.setdefault(alt, set()).add(ent[_EXTERNAL_REF])
+        for ent in entities:
+            name = _canon(ent.get("name", ""))
+            for alt in _alt_names(ent):
+                if name and alt in by_key and alt != name and len(claimants.get(alt, ())) <= 1:
+                    safe_union(name, alt)
+
+    # Ambiguous clusters: similar-but-not-identical keys → candidates for the LLM. Two
+    # system-of-record entities can never merge, so those pairs are skipped -- with a
+    # 2,500-row Alfabet import that is millions of comparisons avoided.
     keys = sorted(by_key)
+    anchored = {k for k in keys if refs.get(uf.find(k))}
     involved: set[str] = set()
-    for i, a in enumerate(keys):
-        for b in keys[i + 1 :]:
-            if uf.find(a) == uf.find(b):
+    matcher = difflib.SequenceMatcher(None)
+    for a in keys:
+        if a in anchored:
+            continue
+        matcher.set_seq2(a)
+        for b in keys:
+            if b == a or (b not in anchored and b < a) or uf.find(a) == uf.find(b):
                 continue
-            if difflib.SequenceMatcher(None, a, b).ratio() >= SIMILARITY_THRESHOLD:
+            matcher.set_seq1(b)
+            if (
+                matcher.real_quick_ratio() >= SIMILARITY_THRESHOLD
+                and matcher.quick_ratio() >= SIMILARITY_THRESHOLD
+                and matcher.ratio() >= SIMILARITY_THRESHOLD
+            ):
                 involved.add(a)
                 involved.add(b)
 
@@ -196,23 +249,34 @@ def _group_type(entities: list[dict], type_key: str, reconcile_fn) -> tuple[_Uni
         ]
         for member_names in reconcile_fn(type_key, candidates):
             member_keys = [_canon(m) for m in member_names if _canon(m) in by_key]
+            distinct = {frozenset(refs[uf.find(k)]) for k in member_keys if refs.get(uf.find(k))}
+            if len(distinct) > 1:
+                notes.append(
+                    f"Possible match among {type_key}: {', '.join(member_names)} -- several are "
+                    "separate Alfabet records, so nothing was merged; set _alfabet_ref by hand if one is right."
+                )
+                continue
             for other in member_keys[1:]:
-                uf.union(member_keys[0], other)
+                safe_union(member_keys[0], other)
 
-    return uf, by_key
+    return uf, by_key, notes
 
 
 def _pick_canonical_name(members: list[dict]) -> str:
-    """Best display name for a merged group: highest confidence, then most specific (longest)."""
+    """Best display name: the system-of-record name, else highest confidence, then longest."""
     return max(
         members,
-        key=lambda e: (_CONF_RANK.get(e.get("confidence", ""), 0), len(e.get("name", ""))),
+        key=lambda e: (
+            bool(e.get(_EXTERNAL_REF)),
+            _CONF_RANK.get(e.get("confidence", ""), 0),
+            len(e.get("name", "")),
+        ),
     ).get("name", "")
 
 
 def _merge_field(members: list[dict], field: str) -> tuple[str, list[str]]:
     """Pick the highest-confidence non-empty/unknown value; report conflicts."""
-    best_val, best_rank = "", -1
+    best_val, best_rank = "", -1.0
     seen: set[str] = set()
     for ent in members:
         # Not every schema field is a string -- `capabilities.level` is an int enum.
@@ -221,7 +285,8 @@ def _merge_field(members: list[dict], field: str) -> tuple[str, list[str]]:
         if not val or val == "unknown":
             continue
         seen.add(val)
-        rank = _CONF_RANK.get(ent.get("confidence", ""), 0)
+        # The system of record wins a tie: the diagram must say so with more confidence.
+        rank = _CONF_RANK.get(ent.get("confidence", ""), 0) + (0.5 if ent.get(_EXTERNAL_REF) else 0)
         if rank > best_rank:
             best_val, best_rank = val, rank
     conflicts = sorted(seen) if len(seen) > 1 else []
@@ -275,9 +340,11 @@ def merge(per_doc_payloads: list[dict], client: anthropic.Anthropic | None = Non
 
     # First pass: group and merge each type, building name maps for reference rewriting.
     merged_by_type: dict[str, list[dict]] = {}
+    match_notes: list[str] = []
     for type_key in ENTITY_KEYS:
         entities = [e for p in per_doc_payloads for e in p.get(type_key, [])]
-        uf, by_key = _group_type(entities, type_key, reconcile_fn)
+        uf, by_key, notes = _group_type(entities, type_key, reconcile_fn)
+        match_notes.extend(notes)
 
         # component root -> member entities
         components: dict[str, list[dict]] = {}
@@ -326,6 +393,7 @@ def merge(per_doc_payloads: list[dict], client: anthropic.Anthropic | None = Non
                 questions.append(
                     f"Conflicting values for {type_key[:-1]} '{ent['name']}': {ent['_conflicts']}"
                 )
+    questions.extend(match_notes)
     merged_payload["open_questions"] = questions
 
     graph = _build_graph(merged_by_type)
@@ -378,6 +446,9 @@ def _merge_entity(type_key: str, members: list[dict]) -> dict:
     merged["confidence"] = _RANK_CONF[base_rank]
 
     merged["_source"] = "; ".join(sources)
+    # More than one reference only when the source itself holds duplicates of one name;
+    # alfabet.py refuses to export such a row until a reviewer picks one.
+    merged[_EXTERNAL_REF] = "; ".join(sorted({m[_EXTERNAL_REF] for m in members if m.get(_EXTERNAL_REF)}))
     surface_names = sorted({m.get("name", "") for m in members})
     merged["_provenance"] = "; ".join(surface_names) if len(surface_names) > 1 else ""
     merged["_conflicts"] = "; ".join(conflicts)

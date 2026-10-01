@@ -3,13 +3,13 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>EATools — diagram to LeanIX</title>
+  <title>EATools — diagram to LeanIX / Alfabet</title>
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
   <header>
     <h1>EATools</h1>
-    <p class="tagline">Extract enterprise-architecture entities from IT diagrams, review, and export to LeanIX.</p>
+    <p class="tagline">Extract enterprise-architecture entities from IT diagrams, review, and export to LeanIX or Bizzdesign Alfabet.</p>
   </header>
 
   <main>
@@ -17,11 +17,31 @@
     <section id="input-stage">
       <div id="dropzone" tabindex="0" aria-label="Upload diagrams">
         <p><strong>Drop diagrams here</strong> or click to choose files</p>
-        <p class="hint">.drawio .xml .vsdx .pptx .pdf .png .jpg .jpeg .gif .webp</p>
+        <p class="hint">.drawio .xml .vsdx .pptx .pdf .png .jpg .jpeg .gif .webp — plus an Alfabet EDC export (.xlsx) to match against</p>
         <input id="file-input" type="file" multiple
-               accept=".drawio,.xml,.vsdx,.pptx,.pdf,.png,.jpg,.jpeg,.gif,.webp" hidden>
+               accept=".drawio,.xml,.vsdx,.pptx,.pdf,.png,.jpg,.jpeg,.gif,.webp,.xlsx,.xlsm" hidden>
       </div>
       <ul id="file-list"></ul>
+
+      <fieldset id="alfabet-field" class="field alfabet-select" hidden>
+        <legend>
+          <label><input id="alfabet-import" type="checkbox"> Import applications from Alfabet</label>
+        </legend>
+        <div class="alfabet-grid">
+          <label>Company <input id="alfabet-company" type="text" placeholder="e.g. ACME"></label>
+          <label>Name <input id="alfabet-name" type="text" placeholder="* wildcards, e.g. *SAP*"></label>
+          <label>Version <input id="alfabet-version" type="text" placeholder="e.g. SaaS"></label>
+          <label>Object state
+            <select id="alfabet-objectstate">
+              <option value="">Any</option>
+              <option>Active</option>
+              <option>Plan</option>
+              <option>Retired</option>
+            </select>
+          </label>
+        </div>
+        <p class="hint">Company matches the owner suffix in Alfabet names, e.g. "Payroll Hub (ACME)". Leave all blank for every application.</p>
+      </fieldset>
 
       <label class="field">
         <span>Architect context (optional)</span>
@@ -36,9 +56,15 @@
                  placeholder="sk-ant-...">
           <button id="key-show" type="button">Show</button>
           <button id="key-clear" type="button">Clear</button>
+          <button id="key-save" type="button" hidden>Save to Keychain</button>
         </div>
-        <p class="hint">Stored only in this tab (sessionStorage). Do not use over plain HTTP beyond localhost — set ANTHROPIC_API_KEY on the server instead.</p>
+        <p class="hint">Kept only in this tab (sessionStorage) unless you choose <em>Save to Keychain</em>, which stores it in this Mac's Keychain for future starts. Do not use over plain HTTP beyond localhost — set ANTHROPIC_API_KEY on the server instead.</p>
       </div>
+
+      <p id="saved-key" class="hint" hidden>
+        Using the Anthropic API key saved in this Mac's Keychain.
+        <button id="key-forget" type="button" class="secondary">Forget saved key</button>
+      </p>
 
       <button id="analyse" type="button" disabled>Analyse</button>
       <p id="status" role="status"></p>
@@ -60,6 +86,8 @@
         <button id="export-sheet" type="button">Export this sheet (CSV)</button>
         <button id="export-graph-json" type="button">Graph (JSON)</button>
         <button id="export-graph-graphml" type="button">Graph (GraphML)</button>
+        <button id="export-alfabet" type="button">Export to Alfabet (EDC)</button>
+        <input id="alfabet-template-input" type="file" accept=".xlsx,.xlsm" hidden>
         <button id="start-over" type="button" class="secondary">Start over</button>
       </div>
     </section>

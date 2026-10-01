@@ -20,6 +20,14 @@ Four backend jobs, each in one module; two data shapes everything speaks in.
   attributes, accumulate evidence + provenance, bump confidence on corroboration.
 - `leanix.py` — declarative `SHEETS` → CSVs + `relations.csv` + `OPEN_QUESTIONS.txt` +
   graph files → zip.
+- `alfabet.py` — Bizzdesign Alfabet EDC workbooks. `read_edc` imports rows as entities
+  (no model call) tagged `_alfabet_ref`; `build_edc` fills the **user's own template**
+  (Alfabet only re-imports workbooks it generated) with Update/Create rows + a report.
+  Picklist values come from the template's reference data; never invent mandatory values.
+  In `merge.py`, two different `_alfabet_ref`s are never merged and the Alfabet value
+  wins ties. Real EDC templates hold company data — tests use a generated one.
+- `alfabet_api.py` — Alfabet REST v2 client (password-grant token, named report queries).
+  Credentials only from `ALFABET_URL/USERNAME/PASSWORD` env; never logged or returned.
 - `app.py` — routing and error mapping only; no business logic.
 
 ## Non-negotiable rules
@@ -33,6 +41,11 @@ Four backend jobs, each in one module; two data shapes everything speaks in.
 - **API key path.** A browser key travels only in the `X-Anthropic-Api-Key` header; never
   log request headers, never add the key to any response, never move it to a query param.
   It lives in `sessionStorage`, masked, with Show/Clear. Document the plain-HTTP caveat.
+  **One opt-in exception:** *Save to Keychain* (`keystore.py`) stores a key in the macOS
+  Keychain after a verification call, and the app loads it on start. Only from a loopback
+  client sending the `X-EATools-Intent` header (forces a CORS preflight the server never
+  approves); the key goes to `security` on stdin, never argv; *Forget* removes it.
+  Never add another place a key is persisted.
 - **Extraction honesty.** The system prompt forbids inventing entities or enriching
   attributes from product knowledge; silent attributes are `unknown`/empty. Every entity
   carries `evidence` + `confidence`; ambiguity goes to `open_questions`. Cross-references

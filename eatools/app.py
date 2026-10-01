@@ -14,15 +14,16 @@ bound beyond localhost over plain HTTP — set the env var there instead (see RE
 
 from __future__ import annotations
 
+import json
 import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import anthropic
-from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response
 
-from . import leanix
+from . import alfabet, alfabet_api, keystore, leanix
 from .extract import ExtractionError, extract
 from .ingest import UnsupportedFile, ingest
 from .merge import merge
@@ -35,6 +36,23 @@ _FRONTEND = Path(__file__).resolve().parent.parent / "frontend"
 _NO_STORE = {"Cache-Control": "no-store"}
 
 app = FastAPI(title="EATools")
+
+# A key the user chose to save (keystore.py) survives restarts; an env key still wins.
+keystore.load_into_env()
+
+_LOOPBACK = {"127.0.0.1", "::1", "localhost"}
+_INTENT_HEADER = "x-eatools-intent"
+
+
+def _require_local_intent(request: Request, intent: str) -> None:
+    """Key persistence is only for the user at this machine, via this app's own page.
+
+    The custom header forces a CORS preflight, which this server never approves, so a
+    third-party page cannot make the browser save (and so hijack) a key here.
+    """
+    host = request.client.host if request.client else ""
+    if host not in _LOOPBACK or request.headers.get(_INTENT_HEADER) != intent:
+        raise HTTPException(status_code=403, detail="Key storage is only available from this computer.")
 
 
 def _server_has_key() -> bool:
@@ -52,48 +70,108 @@ def _build_client(header_key: str | None) -> anthropic.Anthropic:
 
 @app.get("/api/health")
 def health():
+    return {
+        "ok": True,
+        "credentials": _server_has_key(),
+        "saved_key": keystore.is_saved_key_active(),
+        "keychain": keystore.available(),
+        "alfabet": alfabet_api.is_configured(),
+    }
+
+
+@app.post("/api/key")
+def save_key(request: Request, body: dict):
+    _require_local_intent(request, "save-key")
+    key = str(body.get("key", "")).strip()
+    try:
+        if not keystore.valid_format(key):
+            raise keystore.KeystoreError("That does not look like an Anthropic API key (sk-ant-...).")
+        keystore.verify(key)
+        keystore.save(key)
+    except keystore.KeystoreError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    return {"ok": True}
+
+
+@app.delete("/api/key")
+def forget_key(request: Request):
+    _require_local_intent(request, "forget-key")
+    try:
+        keystore.forget()
+    except keystore.KeystoreError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
     return {"ok": True, "credentials": _server_has_key()}
 
 
 @app.post("/api/analyse")
 def analyse(
-    files: list[UploadFile] = File(...),
+    files: list[UploadFile] = File(default=[]),
     context: str = Form(""),
+    alfabet_import: bool = Form(False),
+    alfabet_company: str = Form(""),
+    alfabet_name: str = Form(""),
+    alfabet_version: str = Form(""),
+    alfabet_objectstate: str = Form(""),
     x_anthropic_api_key: str | None = Header(default=None),
 ):
     if len(files) > MAX_FILES:
         raise HTTPException(status_code=413, detail=f"Too many files (max {MAX_FILES}).")
 
-    client = _build_client(x_anthropic_api_key)
-
     sources = []
+    imported = []  # (filename, payload) from Alfabet EDC workbooks -- no model call
     skipped = []
     total = 0
     for upload in files:
+        name = upload.filename or "unnamed"
         data = upload.file.read()
         total += len(data)
         if total > MAX_TOTAL_UPLOAD:
             raise HTTPException(status_code=413, detail="Upload exceeds the total size cap.")
         try:
-            sources.append(ingest(upload.filename or "unnamed", data))
+            if alfabet.is_edc_filename(name):
+                imported.append((name, alfabet.read_edc(name, data)))
+            else:
+                sources.append(ingest(name, data))
         except UnsupportedFile as exc:
-            skipped.append({"name": upload.filename or "unnamed", "reason": str(exc)})
+            skipped.append({"name": name, "reason": str(exc)})
 
-    if not sources:
-        raise HTTPException(status_code=400, detail="No readable diagrams in the upload.")
+    if alfabet_import:
+        try:
+            objects, args = alfabet_api.fetch_selection(
+                alfabet_company, alfabet_name, alfabet_version, alfabet_objectstate
+            )
+        except alfabet_api.AlfabetApiError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from None
+        label = "Alfabet API" + (f" ({', '.join(f'{k}={v}' for k, v in args.items())})" if args else " (all)")
+        if objects:
+            imported.append((label, alfabet.payload_from_api(objects, label)))
+        else:
+            skipped.append({"name": label, "reason": "no applications matched the selection"})
+
+    if not sources and not imported:
+        reasons = "; ".join(f"{s['name']}: {s['reason']}" for s in skipped)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Nothing to analyse -- {reasons}" if reasons else "No readable diagrams or Alfabet input.",
+        )
+
+    # An Alfabet-only import needs no key; with no candidates to reconcile, merge makes no call.
+    client = _build_client(x_anthropic_api_key) if sources or x_anthropic_api_key or _server_has_key() else None
 
     # Per-document extraction, run concurrently. A single doc's failure aborts the batch
     # with its user-safe message; ingest failures were already collected above.
     def run(src):
         return extract(src, context, client)
 
-    try:
-        with ThreadPoolExecutor(max_workers=min(MAX_EXTRACT_WORKERS, len(sources))) as pool:
-            results = list(pool.map(run, sources))
-    except ExtractionError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from None
+    results = []
+    if sources:
+        try:
+            with ThreadPoolExecutor(max_workers=min(MAX_EXTRACT_WORKERS, len(sources))) as pool:
+                results = list(pool.map(run, sources))
+        except ExtractionError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from None
 
-    per_doc_payloads = [payload for payload, _ in results]
+    per_doc_payloads = [payload for _, payload in imported] + [payload for payload, _ in results]
     usage = {"input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0}
     for _, u in results:
         for key in usage:
@@ -105,6 +183,8 @@ def analyse(
     response["_graph"] = merged["graph"]
     response["_merge_report"] = merged["merge_report"]
     response["_sources"] = [
+        {"name": name, "kind": "alfabet", "pages": 0, "images": 0} for name, _ in imported
+    ] + [
         {"name": s.source_name, "kind": s.kind, "pages": len(s.pages), "images": len(s.images)}
         for s in sources
     ]
@@ -138,6 +218,33 @@ def export_graph(body: dict, format: str = "json"):
         content=leanix.graph_json(graph),
         media_type="application/json",
         headers={"Content-Disposition": 'attachment; filename="graph.json"'},
+    )
+
+
+@app.post("/api/export/alfabet")
+def export_alfabet(template: UploadFile = File(...), body: UploadFile = File(...)):
+    """Fill the user's own EDC template; Alfabet only re-imports workbooks it generated.
+
+    The reviewed payload arrives as a file part, not a form field: a full Alfabet import
+    is several MB of JSON and Starlette caps plain form fields at 1 MB.
+    """
+    data = template.file.read(MAX_TOTAL_UPLOAD + 1)
+    raw = body.file.read(MAX_TOTAL_UPLOAD + 1)
+    if len(data) > MAX_TOTAL_UPLOAD or len(raw) > MAX_TOTAL_UPLOAD:
+        raise HTTPException(status_code=413, detail="Upload exceeds the size cap.")
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise HTTPException(status_code=400, detail="Malformed export body.") from None
+    payload = parsed.get("payload", parsed) if isinstance(parsed, dict) else {}
+    try:
+        result = alfabet.build_edc(template.filename or "alfabet.xlsx", data, payload)
+    except UnsupportedFile as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    return Response(
+        content=result,
+        media_type="application/zip",
+        headers={"Content-Disposition": 'attachment; filename="alfabet_export.zip"'},
     )
 
 
