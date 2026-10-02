@@ -412,7 +412,7 @@ def test_analyse_endpoint_imports_alfabet_selection_without_anthropic_key():
     data = res.json()
     assert calls == [("NTT GN", "", "", "Active")]
     assert [a["_alfabet_ref"] for a in data["applications"]] == ["326-1-0"]
-    assert data["_sources"][0]["kind"] == "alfabet" and "name=*(NTT GN)*" in data["_sources"][0]["name"]
+    assert data["_sources"][0]["kind"] == "alfabet" and "name=*NTT GN*" in data["_sources"][0]["name"]
 
 
 def test_export_endpoint_accepts_payload_over_one_megabyte():

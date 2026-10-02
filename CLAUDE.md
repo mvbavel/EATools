@@ -16,7 +16,15 @@ Four backend jobs, each in one module; two data shapes everything speaks in.
 - `extract.py` — one schema-constrained Claude call **per document**. Model
   `claude-opus-4-8`, streaming, adaptive thinking, `effort: high`, cached system prompt.
 - `merge.py` — two steps. `propose()` gives entities stable `_id`s and returns match
-  proposals (exact / alias / fuzzy + optional Claude verdict) with default decisions;
+  proposals with default decisions. Names compare as keys ignoring case, accents,
+  spacing and punctuation, and an Alfabet record matches on its name **without the owner
+  suffix** ("(NTTD EMEAL DACH)" is the owning company, not part of the name; a diagram
+  that spells the owner out picks that record). Methods are exact / alias / partial
+  (word-boundary containment, ≥4 chars, capped per entity) / fuzzy; only partial+fuzzy
+  candidates go to the optional Claude verdict. A **company round** then settles an item
+  with several equally good records (exact/alias/Claude-same): keep the owners matching
+  the Company field, else owner words from the diagram's file name that tell the
+  candidates apart; one left → accepted, others rejected; none → unchanged;
   `merge(accepted=[(id, id)])` merges **only reviewer-accepted pairs**, refusing (and
   reporting in `blocked`) any pair that would join two Alfabet records. Alfabet entities
   are never proposed against each other. Union attributes, accumulate evidence +

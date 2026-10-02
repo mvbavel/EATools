@@ -108,6 +108,7 @@ def forget_key(request: Request):
 def analyse(
     files: list[UploadFile] = File(default=[]),
     context: str = Form(""),
+    company: str = Form(""),
     alfabet_import: bool = Form(False),
     alfabet_company: str = Form(""),
     alfabet_name: str = Form(""),
@@ -178,7 +179,7 @@ def analyse(
         for key in usage:
             usage[key] += u.get(key, 0)
 
-    merged = propose_and_merge(per_doc_payloads, client=client)
+    merged = propose_and_merge(per_doc_payloads, client=client, company=company or alfabet_company)
 
     response = dict(merged["payload"])
     response["_graph"] = merged["graph"]

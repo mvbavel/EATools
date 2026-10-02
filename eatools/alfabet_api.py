@@ -21,6 +21,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 
@@ -44,16 +45,15 @@ def selection_args(company: str = "", name: str = "", version: str = "", objects
     """Selection criteria -> report args, using only arguments the report is known to accept.
 
     The report has no company argument, but Alfabet names carry the owning company as a
-    suffix -- "Payroll Hub (ACME)" -- so a company becomes a name wildcard on that suffix.
+    suffix -- "Payroll Hub (NTTD EMEAL DACH)" -- so a company becomes a name wildcard.
+    Not "*(DACH)*": the company is usually one word of a longer suffix.
     """
     company, name = company.strip(), name.strip()
     args: dict[str, str] = {}
-    if company and name:
-        args["name"] = f"{name}*({company})*"
-    elif company:
-        args["name"] = f"*({company})*"
-    elif name:
-        args["name"] = name
+    if company and company.casefold() not in name.casefold():
+        name = f"{name}*{company}*" if name else f"*{company}*"
+    if name:
+        args["name"] = re.sub(r"\*{2,}", "*", name)
     if version.strip():
         args["version"] = version.strip()
     if objectstate.strip():

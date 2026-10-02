@@ -25,7 +25,7 @@ def _sources():
     """Alfabet import + one diagram, the shape the Matches tab works on."""
     alfabet = read_edc(TEMPLATE, make_template())
     diagram = _payload(applications=[
-        _diagram_app("Billing Hub"),          # org-less name of an Alfabet record -> alias
+        _diagram_app("Billing Hub"),          # Alfabet name without its owner -> exact
         _diagram_app("Payroll"),              # org-less name of TWO records -> ambiguous
         _diagram_app("Fraud Engine"),         # new
         _diagram_app("Fraud Engin", confidence="low"),  # typo -> fuzzy
@@ -56,7 +56,7 @@ def test_proposals_cover_alias_ambiguous_and_fuzzy():
     props, ents = result["proposals"], _entities(sources)
 
     alias = _find(props, "Billing Hub", "Billing Hub (NTT GN)", ents)
-    assert alias and alias["method"] == "alias" and alias["status"] == "accepted", alias
+    assert alias and alias["method"] == "exact" and alias["status"] == "accepted", alias
 
     gn = _find(props, "Payroll", "Payroll (NTT GN)", ents)
     s = _find(props, "Payroll", "Payroll (NTT S)", ents)

@@ -73,6 +73,7 @@ section { margin-top: 1rem; }
 
 .field { display: block; margin: 1rem 0; }
 .field > span { display: block; font-weight: 600; margin-bottom: 0.3rem; }
+.field > span.hint { font-weight: normal; margin: 0.3rem 0 0; }
 textarea, input[type="text"], input[type="password"] {
   width: 100%; padding: 0.5rem; border: 1px solid var(--border);
   border-radius: 6px; background: var(--panel); color: var(--text); font: inherit;

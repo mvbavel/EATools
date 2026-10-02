@@ -29,12 +29,17 @@
       </div>
       <ul id="file-list"></ul>
 
+      <label class="field">
+        <span>Company (optional)</span>
+        <input id="company" type="text" placeholder="e.g. DACH">
+        <span class="hint">When a diagram item matches several Alfabet records of the same name — "SAP S/4HANA (NTTD EMEAL DACH)", "SAP S/4HANA (NTT GN)" — the one owned by this company is chosen. Left blank, the company is read from the diagram's file name.</span>
+      </label>
+
       <fieldset id="alfabet-field" class="field alfabet-select" hidden>
         <legend>
           <label><input id="alfabet-import" type="checkbox"> Import applications from Alfabet</label>
         </legend>
         <div class="alfabet-grid">
-          <label>Company <input id="alfabet-company" type="text" placeholder="e.g. ACME"></label>
           <label>Name <input id="alfabet-name" type="text" placeholder="* wildcards, e.g. *SAP*"></label>
           <label>Version <input id="alfabet-version" type="text" placeholder="e.g. SaaS"></label>
           <label>Object state
@@ -46,7 +51,7 @@
             </select>
           </label>
         </div>
-        <p class="hint">Company matches the owner suffix in Alfabet names, e.g. "Payroll Hub (ACME)". Leave all blank for every application.</p>
+        <p class="hint">The Company above is added as a name wildcard — DACH selects *DACH*, e.g. "Workflex (NTTD EMEAL DACH)". Leave all blank for every application.</p>
       </fieldset>
 
       <label class="field">
@@ -97,6 +102,7 @@
             <option value="">All</option>
             <option value="exact">Exact name</option>
             <option value="alias">Alias / short name</option>
+            <option value="partial">Partial name</option>
             <option value="fuzzy">Fuzzy</option>
           </select>
         </label>

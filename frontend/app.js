@@ -287,9 +287,11 @@ async function analyse() {
   const form = new FormData();
   for (const f of state.files) form.append("files", f);
   form.append("context", $("context").value || "");
+  form.append("company", $("company").value.trim());
   if (alfabetSelected()) {
     form.append("alfabet_import", "true");
-    for (const k of ["company", "name", "version", "objectstate"]) form.append(`alfabet_${k}`, $(`alfabet-${k}`).value || "");
+    form.append("alfabet_company", $("company").value.trim());
+    for (const k of ["name", "version", "objectstate"]) form.append(`alfabet_${k}`, $(`alfabet-${k}`).value || "");
   }
 
   const headers = {};
@@ -355,7 +357,7 @@ function loadMerged(data) {
 const pairKey = (a, b) => [a, b].sort().join("|");
 
 // ---- matches ----------------------------------------------------------------
-const METHOD_LABEL = { exact: "Exact name", alias: "Alias / short name", fuzzy: "Fuzzy" };
+const METHOD_LABEL = { exact: "Exact name", alias: "Alias / short name", partial: "Partial name", fuzzy: "Fuzzy" };
 const DIFF_FIELDS = ["description", "business_criticality", "lifecycle", "hosting", "category", "classification", "level", "parent"];
 
 function setupMatches() {
@@ -403,7 +405,8 @@ function renderMatches() {
   summary.textContent = "";
   summary.appendChild(el("h2", { text: `Matches between sources (${state.proposals.length})` }));
   summary.appendChild(el("p", { class: "hint", text:
-    "Exact and unambiguous alias matches start accepted; fuzzy matches wait for you unless Claude confirmed them. " +
+    "Names are compared ignoring case, spacing and punctuation. Exact and unambiguous alias matches start accepted; " +
+    "partial (extra words) and fuzzy matches wait for you unless Claude confirmed them. " +
     "Two different Alfabet records are never offered as the same thing." }));
   summary.appendChild(el("div", { class: "chips" }, [
     el("span", { class: "meta-chip st-accepted", text: `Accepted ${counts.accepted}` }),

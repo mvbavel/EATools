@@ -5,12 +5,18 @@ Matching is a **reviewable proposal step**, then a deterministic merge:
 1. `propose(per_doc_payloads, reconcile_fn)` gives every entity a stable ``_id`` and
    returns match proposals between entities of the same type:
 
-   * ``exact`` -- same canonical name (accepted by default);
-   * ``alias`` -- an alias / short name / org-less name equals another entity's name
-     (accepted by default when unambiguous);
-   * ``fuzzy`` -- similar names (stdlib ``difflib``), optionally judged by one Claude
-     call per type (``ai`` = same/different); pending unless Claude confirms it and the
-     match is unambiguous.
+   Names are compared as keys that ignore case, accents, spacing and punctuation; a
+   system-of-record name is compared without its owner suffix ("(NTTD EMEAL DACH)").
+
+   * ``exact`` -- same key (accepted by default unless several records share it);
+   * ``alias`` -- an alias / short name equals another entity's name (accepted by
+     default when unambiguous);
+   * ``partial`` -- one name is contained word-for-word in the other (extra words, a
+     diagram's own parenthetical);
+   * ``fuzzy`` -- similar names (stdlib ``difflib``).
+
+   Partial and fuzzy candidates are optionally judged by one Claude call per type
+   (``ai`` = same/different); pending unless Claude confirms one and it is unambiguous.
 
    Two different system-of-record entities (different ``_alfabet_ref``) are never
    proposed as the same thing.
@@ -27,13 +33,20 @@ the decisions and posts them back to re-merge. Nothing is written to disk.
 from __future__ import annotations
 
 import difflib
+import itertools
 import re
+import unicodedata
 
 import anthropic
 
 from .schema import ENTITY_KEYS
 
 SIMILARITY_THRESHOLD = 0.82
+# A partial (contained) name shorter than this anchors on too much: 'SAP', 'HR', 'CRM'.
+PARTIAL_MIN_KEY = 4
+# Partial candidates offered per entity; a generic name inside many record names would
+# otherwise flood the Matches tab.
+PARTIAL_LIMIT = 8
 _CONF_RANK = {"high": 3, "medium": 2, "low": 1, "": 0}
 _RANK_CONF = {3: "high", 2: "medium", 1: "low"}
 
@@ -53,9 +66,35 @@ _REFERENCES = {
 }
 
 
+def _words(name: str) -> list[str]:
+    """Casefolded, accent-folded alphanumeric runs: 'SAP S/4 HANA' -> ['sap', 's', '4', 'hana']."""
+    folded = unicodedata.normalize("NFKD", (name or "").casefold())
+    folded = "".join(ch for ch in folded if not unicodedata.combining(ch))
+    return re.findall(r"[^\W_]+", folded)
+
+
 def _canon(name: str) -> str:
-    """Normalise a name for matching: casefold, strip, collapse non-alphanumerics."""
-    return re.sub(r"[^a-z0-9]+", " ", (name or "").casefold()).strip()
+    """Matching key. Spacing and punctuation are dropped entirely because diagrams and
+    Alfabet disagree on them ('SAP S/4 HANA' vs 'SAP S/4HANA'), never on the letters."""
+    return "".join(_words(name))
+
+
+def _base(name: str) -> str:
+    """Name without a trailing parenthetical: Alfabet suffixes the owning org that way."""
+    return re.sub(r"\s*\([^()]*\)\s*$", "", name or "").strip()
+
+
+def _within(short: str, words: list[str]) -> bool:
+    """`short` (a key) occurs in the words, starting and ending on word boundaries -- so
+    'saps4hana' is in 'SAP S/4HANA Finance' but 'data' is not in 'Metadata Manager'."""
+    long_key = "".join(words)
+    bounds = set(itertools.accumulate((len(w) for w in words), initial=0))
+    start = long_key.find(short)
+    while start != -1:
+        if start in bounds and start + len(short) in bounds:
+            return True
+        start = long_key.find(short, start + 1)
+    return False
 
 
 class _UnionFind:
@@ -160,10 +199,45 @@ def _llm_reconcile(client: anthropic.Anthropic):
 # ---------------------------------------------------------------------------
 
 
+def _match_name(ent: dict) -> str:
+    """The name an entity is matched on. Alfabet suffixes the owning company --
+    'SAP S/4HANA (NTTD EMEAL DACH)' -- which is not part of what the thing is called, so a
+    record matches without it. A diagram's parenthetical may be 'legacy' or 'v2', so it is
+    kept there (the partial step still compares without it)."""
+    name = ent.get("name", "")
+    return (_base(name) or name) if _is_record(ent) else name
+
+
+def _key(ent: dict) -> str:
+    return _canon(_match_name(ent))
+
+
+def _node(ent: dict) -> str:
+    """Candidate-comparison identity: one per record (two records sharing a name are still
+    two things), one per name otherwise."""
+    if _is_record(ent):
+        return "r:" + (ent.get(_EXTERNAL_REF) or ent["_id"])
+    return "n:" + _canon(ent.get("name", ""))
+
+
 def _alt_names(ent: dict) -> set[str]:
-    """Canonical alias + match names (e.g. an Alfabet name without its org suffix)."""
+    """Canonical alias + short names."""
     names = [ent.get("alias", "")] + list(ent.get("_match_names") or [])
     return {_canon(n) for n in names if _canon(n)}
+
+
+def _variants(ent: dict) -> list[tuple[str, list[str]]]:
+    """(key, words) for every name an entity may appear under, for partial/fuzzy checks.
+    A record's owner suffix is left out so owner words never create a match."""
+    name = _match_name(ent)
+    raw = [name, _base(name), ent.get("alias", "")]
+    raw += list(ent.get("_match_names") or [])
+    out: dict[str, list[str]] = {}
+    for name in raw:
+        words = _words(name)
+        if words:
+            out.setdefault("".join(words), words)
+    return list(out.items())
 
 
 def _is_record(ent: dict) -> bool:
@@ -212,14 +286,18 @@ class _Links:
         return True
 
 
-def propose(per_doc_payloads: list[dict], reconcile_fn=None) -> dict:
-    """Match proposals across all documents. Returns {proposals, notes}."""
+def propose(per_doc_payloads: list[dict], reconcile_fn=None, company: str = "") -> dict:
+    """Match proposals across all documents. Returns {proposals, notes}.
+
+    ``company`` (e.g. "DACH") settles a diagram item that matches several Alfabet records
+    equally well; without it the company is read from the diagram's file name.
+    """
     assign_ids(per_doc_payloads)
     proposals: list[dict] = []
     notes: list[str] = []
     for type_key in ENTITY_KEYS:
         entities = [e for p in per_doc_payloads for e in p.get(type_key, []) if _canon(e.get("name", ""))]
-        found, type_notes = _propose_type(type_key, entities, reconcile_fn)
+        found, type_notes = _propose_type(type_key, entities, reconcile_fn, company)
         proposals.extend(found)
         notes.extend(type_notes)
     for i, prop in enumerate(proposals):
@@ -227,7 +305,7 @@ def propose(per_doc_payloads: list[dict], reconcile_fn=None) -> dict:
     return {"proposals": proposals, "notes": notes}
 
 
-def _propose_type(type_key: str, entities: list[dict], reconcile_fn) -> tuple[list[dict], list[str]]:
+def _propose_type(type_key: str, entities: list[dict], reconcile_fn, company: str = "") -> tuple[list[dict], list[str]]:
     by_id = {e["_id"]: e for e in entities}
     # Tracks the default-accepted links so redundant proposals are not generated and
     # default acceptance never chains two external records together.
@@ -235,6 +313,14 @@ def _propose_type(type_key: str, entities: list[dict], reconcile_fn) -> tuple[li
     out: list[dict] = []
     notes: list[str] = []
     proposed: set[frozenset] = set()
+    # Node pairs already offered, so a later step does not repeat a pair via other members
+    # of the same exact-name group.
+    proposed_nodes: set[frozenset] = set()
+    # Names that already match several records exactly: a Claude 'same' on yet another
+    # candidate must not settle them.
+    undecided: set[str] = set()
+    # "Pick one" notes per diagram entity, emitted only if the company round cannot.
+    pick_notes: dict[str, str] = {}
 
     def add(a: dict, b: dict, method: str, score: float, reason: str, accept: bool, ai: str | None = None) -> None:
         pair = frozenset((a["_id"], b["_id"]))
@@ -244,6 +330,7 @@ def _propose_type(type_key: str, entities: list[dict], reconcile_fn) -> tuple[li
             return  # two real records are never the same thing
         accept = accept and links.compatible(a["_id"], b["_id"])
         proposed.add(pair)
+        proposed_nodes.add(frozenset((_node(a), _node(b))))
         out.append(
             {
                 "type": type_key,
@@ -259,140 +346,290 @@ def _propose_type(type_key: str, entities: list[dict], reconcile_fn) -> tuple[li
         if accept:
             links.union(a["_id"], b["_id"])
 
-    # 1. Exact canonical names.
+    def same_name_reason(a: dict, b: dict, base: str) -> str:
+        return base if _canon(a["name"]) == _canon(b["name"]) else base + " (owner suffix ignored)"
+
+    # 1. Exact names (records without their owner suffix). A diagram that copies a
+    # record's full name, suffix and all, joins that record's name too.
+    full_to_key = {_canon(e["name"]): _key(e) for e in entities if _is_record(e)}
+    key_of = {
+        e["_id"]: _key(e) if _is_record(e) else full_to_key.get(_canon(e["name"]), _key(e))
+        for e in entities
+    }
     groups: dict[str, list[dict]] = {}
     for ent in entities:
-        groups.setdefault(_canon(ent["name"]), []).append(ent)
+        groups.setdefault(key_of[ent["_id"]], []).append(ent)
     for members in groups.values():
         if len(members) < 2:
             continue
         records: dict[str, list[dict]] = {}
         free: list[dict] = []
         for ent in members:
-            (records.setdefault(ent[_EXTERNAL_REF], []) if ent.get(_EXTERNAL_REF) else free).append(ent)
+            (records.setdefault(_node(ent), []) if _is_record(ent) else free).append(ent)
         for copies in records.values():  # the same record seen twice
             for other in copies[1:]:
                 add(copies[0], other, "exact", 1.0, "Same name and same Alfabet record", True)
         if len(records) > 1:
-            # Duplicate names in the system of record: offer each candidate, decide nothing.
+            # A diagram that spells out the owner picks its record.
+            for ent in list(free):
+                named = [c for c in records.values() if _canon(c[0]["name"]) == _canon(ent["name"])]
+                if len(named) == 1:
+                    add(named[0][0], ent, "exact", 1.0, "Same name, including the owner", True)
+                    free.remove(ent)
+            # Several records share the name (different owners, or true duplicates): offer
+            # each candidate, decide nothing.
             for ent in free:
+                undecided.add(_node(ent))
                 for copies in records.values():
-                    add(ent, copies[0], "exact", 1.0, "Same name as several Alfabet records", False)
+                    add(ent, copies[0], "exact", 1.0,
+                        same_name_reason(ent, copies[0], "Same name as several Alfabet records"), False)
             if free:
-                notes.append(
-                    f"'{free[0]['name']}' has the same name as {len(records)} separate Alfabet records; "
-                    "pick the right one in Matches."
+                pick_notes[free[0]["_id"]] = (
+                    f"'{free[0]['name']}' has the same name as {len(records)} separate Alfabet records "
+                    f"({', '.join(sorted(c[0]['name'] for c in records.values()))}); pick the right one in Matches."
                 )
             continue
         hub = next(iter(records.values()))[0] if records else members[0]
         for ent in members:
             if ent is not hub:
-                add(hub, ent, "exact", 1.0, "Same name", True)
+                add(hub, ent, "exact", 1.0, same_name_reason(hub, ent, "Same name"), True)
 
-    # 2. Aliases, short names and org-less names (applications).
-    if type_key == "applications":
-        claimants: dict[str, set[str]] = {}
-        for ent in entities:
-            if ent.get(_EXTERNAL_REF):
-                for alt in _alt_names(ent):
-                    claimants.setdefault(alt, set()).add(ent[_EXTERNAL_REF])
-        for ent in entities:
-            own = _canon(ent["name"])
-            for alt in _alt_names(ent):
-                if alt == own:
+    # 2. Aliases and short names.
+    claimants: dict[str, set[str]] = {}
+    for ent in entities:
+        if _is_record(ent):
+            for alt in _alt_names(ent) | {_key(ent)}:
+                claimants.setdefault(alt, set()).add(_node(ent))
+    for ent in entities:
+        own = key_of[ent["_id"]]
+        for alt in _alt_names(ent):
+            if alt == own:
+                continue
+            ambiguous = len(claimants.get(alt, ())) > 1
+            for target in groups.get(alt, []):
+                if links.same(ent["_id"], target["_id"]):
                     continue
-                ambiguous = len(claimants.get(alt, ())) > 1
-                for target in groups.get(alt, []):
-                    if links.same(ent["_id"], target["_id"]):
-                        continue
-                    reason = f"'{target['name']}' is an alias / short name of '{ent['name']}'"
-                    if ambiguous:
-                        reason += " -- but several Alfabet records share it"
-                    add(ent, target, "alias", 0.95, reason, not ambiguous)
+                reason = f"'{target['name']}' is an alias / short name of '{ent['name']}'"
+                if ambiguous:
+                    reason += " -- but several Alfabet records share it"
+                    undecided.add(_node(target if _is_record(ent) else ent))
+                add(ent, target, "alias", 0.95, reason, not ambiguous)
 
-    # 3. Fuzzy names, with an optional Claude verdict. Comparisons are between canonical
-    # names; two system-of-record names are never compared (millions of pairs saved on a
-    # full Alfabet import).
+    # 3. Partial and fuzzy names, with an optional Claude verdict; never accepted without
+    # one. Only non-record names are compared (against everything): two system-of-record
+    # names are never the same thing, and skipping them saves millions of pairs on a full
+    # Alfabet import.
     rep: dict[str, dict] = {}
-    for key, members in groups.items():
-        rep[key] = next((m for m in members if _is_record(m)), members[0])
+    for ent in entities:
+        rep.setdefault(_node(ent), ent)
     keys = sorted(rep)
     anchored = {k for k in keys if _is_record(rep[k])}
-    pairs: list[tuple[str, str, float]] = []
+    variants = {k: _variants(rep[k]) for k in keys}
+    pairs: list[tuple[str, str, float, str]] = []
     matcher = difflib.SequenceMatcher(None)
     for a in keys:
         if a in anchored:
             continue
-        matcher.set_seq2(a)
+        partial: list[tuple[str, str, float, str]] = []
         for b in keys:
-            if b == a or (b not in anchored and b < a) or links.same(rep[a]["_id"], rep[b]["_id"]):
+            if b == a or (b not in anchored and b < a) or frozenset((a, b)) in proposed_nodes:
                 continue
-            matcher.set_seq1(b)
-            if (
-                matcher.real_quick_ratio() >= SIMILARITY_THRESHOLD
-                and matcher.quick_ratio() >= SIMILARITY_THRESHOLD
-            ):
-                score = matcher.ratio()
-                if score >= SIMILARITY_THRESHOLD:
-                    pairs.append((a, b, score))
+            # Same key: already offered by the exact step.
+            if key_of[rep[a]["_id"]] == key_of[rep[b]["_id"]] or links.same(rep[a]["_id"], rep[b]["_id"]):
+                continue
+            found = _compare(variants[a], variants[b], matcher)
+            if found:
+                method, score = found
+                (partial if method == "partial" else pairs).append((a, b, score, method))
+        partial.sort(key=lambda p: -p[2])
+        if len(partial) > PARTIAL_LIMIT:
+            notes.append(
+                f"'{rep[a]['name']}' appears inside {len(partial)} {type_key} names; only the "
+                f"{PARTIAL_LIMIT} closest are offered in Matches."
+            )
+        pairs.extend(partial[:PARTIAL_LIMIT])
 
     verdict: dict[frozenset, str] = {}
     if pairs and reconcile_fn is not None:
-        involved = sorted({k for a, b, _ in pairs for k in (a, b)})
+        involved = sorted({k for a, b, _, _ in pairs for k in (a, b)})
         candidates = [
             {
                 "name": rep[k].get("name", ""),
-                "description": rep[k].get("description", ""),
+                # Alfabet descriptions can run to pages; the name carries the identity.
+                "description": (rep[k].get("description") or "")[:300],
                 "sources": rep[k].get("_source", ""),
             }
             for k in involved
         ]
+        # Claude answers in names; records sharing a full name map to every such record,
+        # which the record_hits check below then treats as ambiguous.
+        nodes_named: dict[str, list[str]] = {}
+        for k in involved:
+            nodes_named.setdefault(_canon(rep[k].get("name", "")), []).append(k)
         group_of: dict[str, int] = {}
         for gi, member_names in enumerate(reconcile_fn(type_key, candidates)):
             for name in member_names:
-                if _canon(name) in rep:
-                    group_of[_canon(name)] = gi
-        for a, b, _ in pairs:
+                for k in nodes_named.get(_canon(name), []):
+                    group_of[k] = gi
+        for a, b, _, _ in pairs:
             same = a in group_of and group_of.get(a) == group_of.get(b)
             verdict[frozenset((a, b))] = "same" if same else "different"
         # Claude may group names the similarity pass did not pair; offer those too.
         by_group: dict[int, list[str]] = {}
         for key, gi in group_of.items():
             by_group.setdefault(gi, []).append(key)
-        paired = {frozenset((a, b)) for a, b, _ in pairs}
+        paired = {frozenset((a, b)) for a, b, _, _ in pairs}
         for members in by_group.values():
             for i, a in enumerate(members):
                 for b in members[i + 1 :]:
                     if frozenset((a, b)) not in paired and not (a in anchored and b in anchored):
-                        pairs.append((a, b, difflib.SequenceMatcher(None, a, b).ratio()))
+                        score = difflib.SequenceMatcher(None, _key(rep[a]), _key(rep[b])).ratio()
+                        pairs.append((a, b, score, "fuzzy"))
                         verdict[frozenset((a, b))] = "same"
 
     # A name Claude ties to several separate records is ambiguous: offer, don't accept.
     record_hits: dict[str, set[str]] = {}
-    for a, b, _ in pairs:
+    for a, b, _, _ in pairs:
         if verdict.get(frozenset((a, b))) == "same":
             for x, y in ((a, b), (b, a)):
-                if y in anchored and rep[y].get(_EXTERNAL_REF):
-                    record_hits.setdefault(x, set()).add(rep[y][_EXTERNAL_REF])
+                if y in anchored:
+                    record_hits.setdefault(x, set()).add(y)
     for key, refs in record_hits.items():
         if len(refs) > 1:
-            names = [rep[key]["name"]] + sorted(
-                rep[k]["name"] for k in anchored if rep[k].get(_EXTERNAL_REF) in refs
-            )
-            notes.append(
+            names = [rep[key]["name"]] + sorted(rep[k]["name"] for k in refs)
+            pick_notes[rep[key]["_id"]] = (
                 f"Possible match among {type_key}: {', '.join(names)} -- several are separate "
                 "Alfabet records, so nothing was merged; pick one in Matches."
             )
 
-    for a, b, score in sorted(pairs, key=lambda p: -p[2]):
+    for a, b, score, method in sorted(pairs, key=lambda p: -p[2]):
         ai = verdict.get(frozenset((a, b)))
         ambiguous = len(record_hits.get(a, ())) > 1 or len(record_hits.get(b, ())) > 1
-        reason = f"Similar names ({score:.0%})"
+        ambiguous = ambiguous or a in undecided or b in undecided
+        if method == "partial":
+            reason = "One name contains the other (extra words)"
+        else:
+            reason = f"Similar names ({score:.0%})"
         if ai:
             reason += f"; Claude judged them {'the same' if ai == 'same' else 'different'}"
-        add(rep[a], rep[b], "fuzzy", score, reason, ai == "same" and not ambiguous, ai)
+        add(rep[a], rep[b], method, score, reason, ai == "same" and not ambiguous, ai)
 
+    settled = _company_round(out, by_id, links, company, notes)
+    notes.extend(n for eid, n in pick_notes.items() if eid not in settled)
     return out, notes
+
+
+def _owner(name: str) -> list[str]:
+    """Words of a record's owner suffix: 'X (NTTD EMEAL DACH)' -> ['nttd', 'emeal', 'dach']."""
+    m = re.search(r"\(([^()]*)\)\s*$", name or "")
+    return _words(m.group(1)) if m else []
+
+
+def _file_words(ent: dict) -> set[str]:
+    """Words of the file names an entity was extracted from, without extensions."""
+    stems = (re.sub(r"\.[A-Za-z0-9]{1,5}$", "", src.strip()) for src in (ent.get("_source") or "").split(";"))
+    return {w for stem in stems for w in _words(stem)}
+
+
+# Shorter file-name words ('S', 'CN', 'v7') say too little to decide an owner.
+_FILE_OWNER_MIN = 3
+
+
+def _company_round(out: list[dict], by_id: dict[str, dict], links: _Links, company: str, notes: list[str]) -> set[str]:
+    """Second round for a diagram item matching several Alfabet records equally well (same
+    name, alias, or Claude 'same'): keep only the records whose owner suffix is the company.
+    One left: accept it and reject the rest. Several: reject the others, leave those
+    pending. None: change nothing. Returns the ids of the diagram items settled.
+
+    The company is ``company`` when given, else the diagram's file name -- using only words
+    that tell the candidate owners apart, so 'NTT' in a file name decides nothing when
+    every candidate is NTT-owned."""
+    by_item: dict[str, list[dict]] = {}
+    for p in out:
+        a, b = by_id[p["a"]], by_id[p["b"]]
+        if p["status"] != "pending" or _is_record(a) == _is_record(b):
+            continue
+        item = a if not _is_record(a) else b
+        by_item.setdefault(item["_id"], []).append(p)
+
+    def record_of(p: dict) -> dict:
+        return by_id[p["b"]] if _is_record(by_id[p["b"]]) else by_id[p["a"]]
+
+    wanted = _canon(company)
+    settled: set[str] = set()
+    for item_id, props in by_item.items():
+        strong = [p for p in props if p["method"] in ("exact", "alias") or p["ai"] == "same"]
+        if len({record_of(p)["_id"] for p in strong}) < 2:
+            continue
+        item = by_id[item_id]
+        owner = {id(p): _owner(record_of(p)["name"]) for p in strong}
+        if wanted:
+            hits = [p for p in strong if _within(wanted, owner[id(p)])]
+            label = f"company '{company.strip()}'"
+        else:
+            shared = set.intersection(*(set(w) for w in owner.values()))
+            clues = {
+                w for w in _file_words(item)
+                if len(w) >= _FILE_OWNER_MIN and w not in shared and any(w in o for o in owner.values())
+            }
+            if not clues:
+                continue
+            hits = [p for p in strong if clues & set(owner[id(p)])]
+            label = f"company '{' '.join(sorted(clues)).upper()}' from the file name"
+        if not hits:
+            if wanted:
+                notes.append(
+                    f"None of the {len(strong)} Alfabet records matching '{item['name']}' belongs to "
+                    f"{label}; pick one in Matches."
+                )
+            continue
+        if len(hits) == len(strong):
+            continue
+        if len(hits) == 1:
+            pick = hits[0]
+            if links.union(pick["a"], pick["b"]):
+                pick["status"] = "accepted"
+                pick["reason"] += f"; owner matches {label}"
+                for p in props:
+                    if p is not pick:
+                        p["status"] = "rejected"
+                        p["reason"] += f"; owner is not {label}"
+                settled.add(item_id)
+            continue
+        for p in strong:
+            if p not in hits:
+                p["status"] = "rejected"
+                p["reason"] += f"; owner is not {label}"
+        for p in hits:
+            p["reason"] += f"; {len(hits)} candidates owned by {label}"
+    return settled
+
+
+def _compare(va, vb, matcher: difflib.SequenceMatcher) -> tuple[str, float] | None:
+    """Best relation between two entities' name variants: ``partial`` when one name (or its
+    org-less form) is contained word-for-word in the other, else ``fuzzy`` when similar.
+    Scores stay below 1 so they never read as an exact match."""
+    best = 0.0
+    is_partial = False
+    for ka, wa in va:
+        matcher.set_seq2(ka)
+        for kb, wb in vb:
+            matcher.set_seq1(kb)
+            if ka == kb or (len(ka) >= PARTIAL_MIN_KEY and _within(ka, wb)) or (
+                len(kb) >= PARTIAL_MIN_KEY and _within(kb, wa)
+            ):
+                is_partial = True
+                best = max(best, matcher.ratio())
+                continue
+            # The quick upper bounds skip the full ratio for almost every pair.
+            floor = max(best, SIMILARITY_THRESHOLD)
+            if matcher.real_quick_ratio() >= floor and matcher.quick_ratio() >= floor:
+                best = max(best, matcher.ratio())
+    if is_partial:
+        return "partial", min(best, 0.99)
+    if best >= SIMILARITY_THRESHOLD:
+        return "fuzzy", min(best, 0.99)
+    return None
 
 
 def _pick_canonical_name(members: list[dict]) -> str:
@@ -455,6 +692,7 @@ def merge(
     client: anthropic.Anthropic | None = None,
     reconcile_fn=None,
     accepted: list[tuple[str, str]] | None = None,
+    company: str = "",
 ):
     """Consolidate per-document payloads. Returns {payload, graph, merge_report, blocked}.
 
@@ -465,7 +703,7 @@ def merge(
     if accepted is None:
         if reconcile_fn is None and client is not None:
             reconcile_fn = _llm_reconcile(client)
-        proposed = propose(per_doc_payloads, reconcile_fn)
+        proposed = propose(per_doc_payloads, reconcile_fn, company)
         accepted = [(p["a"], p["b"]) for p in proposed["proposals"] if p["status"] == "accepted"]
         notes = proposed["notes"]
     else:
@@ -476,9 +714,11 @@ def merge(
     return result
 
 
-def propose_and_merge(per_doc_payloads: list[dict], client: anthropic.Anthropic | None = None) -> dict:
+def propose_and_merge(
+    per_doc_payloads: list[dict], client: anthropic.Anthropic | None = None, company: str = ""
+) -> dict:
     """Proposals plus the merge of their defaults: what the review UI starts from."""
-    proposed = propose(per_doc_payloads, _llm_reconcile(client) if client is not None else None)
+    proposed = propose(per_doc_payloads, _llm_reconcile(client) if client is not None else None, company)
     accepted = [(p["a"], p["b"]) for p in proposed["proposals"] if p["status"] == "accepted"]
     merged = _merge_accepted(per_doc_payloads, accepted)
     merged["proposals"] = proposed["proposals"]

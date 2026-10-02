@@ -145,11 +145,17 @@ def test_fetch_all_rejects_unexpected_format():
         raise AssertionError("expected AlfabetApiError")
 
 
-def test_selection_args_map_company_to_name_suffix():
+def test_selection_args_map_company_to_a_name_wildcard():
+    """The owner suffix is e.g. '(NTTD EMEAL DACH)': company 'DACH' must match a word inside
+    it, so '*(DACH)*' (whole suffix) returned nothing."""
     from eatools.alfabet_api import selection_args
 
-    assert selection_args(company="ACME") == {"name": "*(ACME)*"}
-    assert selection_args(company="ACME", name="Open*") == {"name": "Open**(ACME)*"}
+    assert selection_args(company="DACH") == {"name": "*DACH*"}
+    assert selection_args(company="DACH", name="SAP*") == {"name": "SAP*DACH*"}
+    assert selection_args(company="DACH", name="*SAP*") == {"name": "*SAP*DACH*"}
+    # A name that already carries the company is not narrowed twice ('*DACH**DACH*').
+    assert selection_args(company="DACH", name="*DACH*") == {"name": "*DACH*"}
+    assert selection_args(company="dach", name="*(NTTD EMEAL DACH)*") == {"name": "*(NTTD EMEAL DACH)*"}
     assert selection_args(name="*SAP*", version="SaaS", objectstate="Active") == {
         "name": "*SAP*", "version": "SaaS", "objectstate": "Active"}
     assert selection_args() == {}
